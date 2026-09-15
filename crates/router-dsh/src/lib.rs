@@ -1,6 +1,6 @@
 //! # router-dsh
 //!
-//! The DeepSeek Harness adapter: process supervision, readiness detection, and
+//! The `DeepSeek Harness` adapter: process supervision, readiness detection, and
 //! the harness-specific knowledge the rest of the system must not have.
 //!
 //! # The adapter rule
@@ -9,7 +9,7 @@
 //! crate may encode harness-specific behaviour, because the harness is in
 //! developer preview and breaking changes are expected. Confining that coupling
 //! here is what makes an upstream change a localized edit rather than a rewrite
-//! (PROPOSAL.md §P-16.3, risk RSK-06).
+//! (which keeps an upstream change a localized edit).
 //!
 //! ```
 //! use router_dsh::readiness::{classify_line, OutputSignal};

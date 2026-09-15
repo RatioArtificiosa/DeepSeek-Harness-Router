@@ -21,7 +21,7 @@
 //!    a WebSocket for live agent output. Buffering a response would turn a
 //!    live session into a stalled one.
 //!
-//! See PROPOSAL.md §P-09.
+//! This is why the relay exists rather than a workaround.
 
 #![deny(missing_docs)]
 #![deny(clippy::all)]

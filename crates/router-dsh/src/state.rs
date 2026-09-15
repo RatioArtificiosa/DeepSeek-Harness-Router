@@ -168,14 +168,16 @@ impl RuntimeFailure {
     /// there is one, because the tail is usually the actual explanation.
     #[must_use]
     pub fn user_message(&self) -> String {
+        use std::fmt::Write as _;
+
         let mut out = format!("{}: {}", self.code, self.detail);
         if let Some(code) = self.exit_code {
-            out.push_str(&format!("\n  exit code: {code}"));
+            let _ = write!(out, "\n  exit code: {code}");
         }
         if !self.stderr_tail.is_empty() {
             out.push_str("\n  last output:");
             for line in &self.stderr_tail {
-                out.push_str(&format!("\n    {line}"));
+                let _ = write!(out, "\n    {line}");
             }
         }
         out

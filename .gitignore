@@ -2,15 +2,16 @@
 # DeepSeek Harness Router — repository ignore rules
 # ─────────────────────────────────────────────────────────────────────
 
-# Local environment: contains absolute paths from THIS machine. Never commit.
-.env
-.env.local
-.env.*.local
-!.env.example
+# ── WORKING PLANS ────────────────────────────────────────────────────
+# The architecture proposal and execution checklist are authoring
+# documents for this machine, not published repository content.
+# They stay on disk and out of every commit.
+PROPOSAL.md
+CHECKLIST.md
 
 # ── PRIVATE INSTALLER ────────────────────────────────────────────────
-# The owner's personal installer is deliberately NOT part of this repo.
-# See PROPOSAL.md §P-44.3.
+# The owner's personal installation tooling is deliberately absent
+# from this repository.
 installer/
 *.local.md
 *.local.ps1
@@ -19,24 +20,31 @@ router-image.tar
 router-image.tar.gz
 checksums.local.txt
 
-# Runtime state
+# ── LOCAL ENVIRONMENT ────────────────────────────────────────────────
+# Contains absolute paths from this machine. Never commit.
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ── RUNTIME STATE ────────────────────────────────────────────────────
 /data/
 /workspace/
 *.log
 logs/
 
-# Rust
+# ── RUST ─────────────────────────────────────────────────────────────
 target/
 **/target/
-# Cargo.lock IS committed: this workspace produces a binary, so the lockfile
-# is the reproducibility contract (PROPOSAL.md 43.4, 15.2).
+# Cargo.lock IS committed: this workspace produces a binary, so the
+# lockfile is the reproducibility contract.
 
-# Node (build tooling only; the runtime never needs it on the host)
+# ── NODE (build tooling only; the runtime never needs it) ────────────
 node_modules/
 **/node_modules/
 .pnpm-store/
 
-# Editors & OS
+# ── EDITORS AND OS ───────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
@@ -44,7 +52,7 @@ node_modules/
 Thumbs.db
 desktop.ini
 
-# Build artifacts
+# ── BUILD ARTIFACTS ──────────────────────────────────────────────────
 dist/
 build/
 *.tar

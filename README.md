@@ -4,14 +4,14 @@
 
 <br>
 
-**Run more than one DeepSeek Harness at once. One per project, one per model.**
+**Run more than one DeepSeek Harness at once.**
 
 A local control plane for the DeepSeek Harness agent — so you can work on
 several projects in parallel, each with its own workspace and its own model,
 without them interfering with each other.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-4f8cff.svg?style=flat-square)](LICENSE)
-[![Built with Rust](https://img.shields.io/badge/core-Rust-f74c00.svg?style=flat-square&logo=rust&logoColor=white)](PROPOSAL.md#p-42--language-decision-rust-for-the-router-core)
+[![Built with Rust](https://img.shields.io/badge/core-Rust-f74c00.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Harness](https://img.shields.io/badge/harness-0.1.5--rc.1-37e0c8.svg?style=flat-square)](docs/dsh-compatibility.md)
 [![Status: in development](https://img.shields.io/badge/status-in%20development-ffce6a.svg?style=flat-square)](#-project-status)
 
@@ -27,13 +27,11 @@ without them interfering with each other.
 >
 > **This project is under active development and does not run yet.**
 >
-> The architecture and execution plan are complete and reviewed — see
-> [`PROPOSAL.md`](PROPOSAL.md) and [`CHECKLIST.md`](CHECKLIST.md). The Rust core
-> and the multi-instance supervisor are being built now.
+> The Rust core is written and tested; the multi-instance supervisor and the
+> `router` command are being built now.
 >
-> Everything below describes what the finished system does. If you want to follow
-> along or contribute, the checklist is the map: it is ordered, and every line
-> cites the design section it implements.
+> Everything below describes what the finished system does — how it isolates
+> instances, allocates ports, and keeps your existing install untouched.
 >
 > **Star the repository** to be notified when the first working release lands.
 
@@ -209,8 +207,7 @@ sit between you and your agent once they are running.
 | `crates/router-relay` | A streaming HTTP proxy, used by the control page |
 | `crates/router-dsh` | The harness adapter: supervision and readiness detection |
 | `crates/router-cli` | The `router` binary |
-| `PROPOSAL.md` | The specification. §P-48 onward is the current design |
-| `CHECKLIST.md` | The execution plan — every line cites the proposal |
+| `docs/` | Security notes, permissions, troubleshooting |
 
 </details>
 
@@ -380,14 +377,15 @@ project, so that building and testing never touches a working installation.
 
 ## Contributing
 
-Issues and pull requests are welcome. Before changing anything:
+Issues and pull requests are welcome.
 
-1. Find the section of [`PROPOSAL.md`](PROPOSAL.md) that specifies it.
-2. Find the checklist line in [`CHECKLIST.md`](CHECKLIST.md) that tracks it.
-3. If either is missing or wrong, fix the document first, then the code.
+Read [`AGENTS.md`](AGENTS.md) first — it carries the working rules, in particular
+the constraints that protect a running DeepSeek Harness installation and the
+repository's privacy requirements.
 
-Read [`AGENTS.md`](AGENTS.md) for the working rules — particularly the
-constraints on host filesystems, Docker resources, and repository privacy.
+Every source file is documented, every public item is typed, and `cargo clippy`
+runs with `-D warnings`. A change that leaves a warning is a change that is not
+finished.
 
 ---
 

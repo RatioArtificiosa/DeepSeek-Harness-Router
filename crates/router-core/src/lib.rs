@@ -5,7 +5,7 @@
 //!
 //! This crate has no dependency on `DeepSeek Harness` itself. Coupling to the
 //! harness is confined to `router-dsh`, so a breaking upstream change stays a
-//! localized edit (PROPOSAL.md §P-16.3).
+//! localized edit rather than a rewrite.
 //!
 //! ```
 //! use router_core::workspace::{validate_workspace, WorkspaceMode};

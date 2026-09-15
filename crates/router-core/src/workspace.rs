@@ -3,7 +3,7 @@
 //! This module is the single gate through which a host directory becomes the
 //! container's `/workspace`. It is deliberately strict and deliberately
 //! platform-aware, because naive path handling is the top failure mode for a
-//! cross-platform container product (PROPOSAL.md §P-10.3, risk RSK-04).
+//! cross-platform product: it is the top failure mode for this class of tool.
 //!
 //! # The seven hazards it handles
 //!
@@ -27,7 +27,7 @@ use std::path::{Component, Path, PathBuf};
 /// The container path the workspace is always mounted at.
 ///
 /// The application never sees a host path; this constant is why
-/// (PROPOSAL.md §P-10.1 rules W-02/W-03).
+/// The application never sees a host path; this constant is why.
 pub const WORKSPACE_MOUNT: &str = "/workspace";
 
 /// How the workspace directory was obtained.

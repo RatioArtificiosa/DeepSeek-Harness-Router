@@ -171,4 +171,4 @@ reproduction steps and the affected version.
 Every control above is testable. The repository's CI asserts the rendered
 Compose configuration contains no privileged mode, no Docker socket, no host
 networking, a complete capability drop, and a read-only root filesystem — and the
-checklist in `CHECKLIST.md` carries the corresponding acceptance tests.
+project's test suite carries the corresponding acceptance tests.

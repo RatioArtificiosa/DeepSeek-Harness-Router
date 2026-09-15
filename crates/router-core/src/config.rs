@@ -1,6 +1,6 @@
 //! Configuration: what the container reads from its environment.
 //!
-//! The launcher owns the host-specific values (PROPOSAL.md §P-13); this module
+//! The launcher owns the host-specific values; this module
 //! is the container's typed view of them. Every field has a documented default
 //! so the container can start with nothing but a workspace mounted.
 
@@ -15,13 +15,13 @@ pub const DEFAULT_APP_PORT: u16 = 3080;
 ///
 /// Deliberately different from [`DEFAULT_APP_PORT`]: the relay owns the
 /// published port and forwards to this one, which lets the harness keep its
-/// safe loopback bind (PROPOSAL.md §P-09).
+/// safe loopback bind, which is why the relay exists as a separate component.
 pub const DEFAULT_DSH_INTERNAL_PORT: u16 = 3081;
 
 /// Where the harness keeps its state inside the container.
 ///
 /// This is what isolates us from any harness installation on the host
-/// (PROPOSAL.md §P-05.2).
+/// Setting it per instance is what keeps two instances from sharing state.
 pub const DEFAULT_DSH_HOME: &str = "/data/dsh";
 
 /// Log verbosity.

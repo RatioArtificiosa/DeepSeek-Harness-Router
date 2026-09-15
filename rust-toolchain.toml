@@ -1,6 +1,6 @@
 # Pinned toolchain: the host toolchain is a convenience for editor feedback,
-# never a build dependency. The container builds with this same channel.
-# See PROPOSAL.md 42.7 and 43.5.
+# never a build dependency. The container builds with this same channel, so
+# the two cannot disagree.
 [toolchain]
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]

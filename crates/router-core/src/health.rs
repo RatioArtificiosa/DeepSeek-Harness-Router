@@ -1,7 +1,7 @@
 //! The `/health` contract.
 //!
 //! The launcher blocks on this endpoint before telling the user the system is
-//! ready (PROPOSAL.md §P-25.9), so the shape here is a public contract, not an
+//! ready, so the shape here is a public contract, not an
 //! internal detail.
 //!
 //! # Why `degraded` returns HTTP 200

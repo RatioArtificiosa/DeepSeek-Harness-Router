@@ -2,7 +2,7 @@
 //!
 //! Every failure the user can encounter has a stable `code`, a plain-language
 //! message, and — where one exists — a remediation hint. This is the
-//! "every failure names its cause and its fix" rule from PROPOSAL.md §P-26.1.
+//! "every failure names its cause and its fix" rule this project holds itself to.
 //!
 //! Codes are part of the public contract: `/health` reports them, the launcher
 //! greps for them, and `docs/troubleshooting.md` documents each one.

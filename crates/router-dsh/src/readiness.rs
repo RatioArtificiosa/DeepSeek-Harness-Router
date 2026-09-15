@@ -11,7 +11,7 @@
 //! it proves only that the harness *believes* it is ready; it does not prove
 //! the socket accepts connections. The supervisor therefore requires **both**
 //! the line and a successful HTTP probe, and never a fixed sleep
-//! (PROPOSAL.md §P-11.4).
+//! never a fixed sleep.
 //!
 //! This module owns the line parsing, which is the part worth testing: a
 //! regex that quietly stops matching after an upstream release would turn a
@@ -21,7 +21,10 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputSignal {
     /// The readiness line, carrying the URL the harness believes it serves.
-    Ready { url: String },
+    Ready {
+        /// The authenticated URL the harness announced.
+        url: String,
+    },
     /// The harness reported a build problem.
     FrontendMissing,
     /// The harness reported a missing or unusable credential.
@@ -72,9 +75,7 @@ pub fn classify_line(line: &str) -> OutputSignal {
     }
     // A build hint is only meaningful when paired with the frontend wording;
     // "pnpm run build" alone appears in unrelated advice.
-    if FRONTEND_MARKERS[0..2].iter().any(|m| lower.contains(m))
-        && lower.contains("dist")
-    {
+    if FRONTEND_MARKERS[0..2].iter().any(|m| lower.contains(m)) && lower.contains("dist") {
         return OutputSignal::FrontendMissing;
     }
 
@@ -107,20 +108,47 @@ pub fn extract_ready_url(line: &str) -> Option<String> {
         .collect();
 
     if url.starts_with("http://") || url.starts_with("https://") {
-        Some(url.trim_end_matches(|c: char| c == '.' || c == ',').to_string())
+        Some(url.trim_end_matches(['.', ',']).to_string())
     } else {
         None
     }
 }
 
 /// Whether a line indicates the harness has given up.
+///
+/// Deliberately conservative: it must not fire on ordinary startup chatter, so
+/// it looks for an explicit failure marker rather than merely the word "error"
+/// appearing somewhere in a line.
+///
+/// The `dsh:` prefix is the launcher's own diagnostic channel, which formats
+/// failures as `dsh: <CODE>: <message>`. Any such line is a real failure, so
+/// the code does not need to contain the word "error" for us to trust it —
+/// `dsh: DSH_READY_TIMEOUT: gave up` is exactly as fatal as
+/// `dsh: DSH_EXITED: the runtime stopped`.
 #[must_use]
 pub fn is_fatal(line: &str) -> bool {
+    // Check the original casing for the code, because a screaming-snake
+    // identifier is uppercase by definition and lowercasing it first would
+    // destroy the very signal we are looking for.
+    if let Some(rest) = line.trim().strip_prefix("dsh: ") {
+        // The headless runner narrates progress on this channel; it is not a
+        // failure, and mistaking it for one would abort healthy runs.
+        if rest.to_ascii_lowercase().starts_with("reasoning:") {
+            return false;
+        }
+        if let Some(code) = rest.split(':').next() {
+            let looks_like_a_code = code.len() > 3
+                && code
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+            if looks_like_a_code {
+                return true;
+            }
+        }
+    }
+
     let lower = line.to_ascii_lowercase();
-    lower.contains("error:")
-        || lower.contains("fatal")
-        || lower.starts_with("dsh: ")
-            && (lower.contains("error") || lower.contains("failed"))
+    lower.contains("error:") || lower.contains("fatal") || lower.contains("panic")
 }
 
 /// Keep only the last `n` lines of a rolling buffer.

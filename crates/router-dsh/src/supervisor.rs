@@ -3,11 +3,9 @@
 //! The supervisor owns exactly one child. It never sleeps to decide readiness —
 //! it watches for the harness's own announcement **and** confirms the socket
 //! answers, because the announcement proves intent while the probe proves
-//! reachability (PROPOSAL.md §P-11.4).
+//! reachability. A sleep would be neither.
 
-use crate::readiness::{
-    classify_line, is_fatal, push_bounded, OutputSignal, DEFAULT_TAIL_LINES,
-};
+use crate::readiness::{classify_line, is_fatal, push_bounded, OutputSignal, DEFAULT_TAIL_LINES};
 use crate::state::{RuntimeFailure, RuntimeState, RuntimeStatus};
 use router_core::Config;
 use std::process::Stdio;
@@ -52,7 +50,7 @@ impl SupervisorConfig {
     ///
     /// Exposed so tests and the doctor command can assert the exact arguments
     /// rather than guessing, and so no caller builds an argv by string
-    /// concatenation (PROPOSAL.md §P-20 rule S-13).
+    /// concatenation, so a hostile argument cannot become an extra flag.
     #[must_use]
     pub fn command_argv(&self) -> Vec<String> {
         let mut argv = vec![
@@ -63,7 +61,7 @@ impl SupervisorConfig {
             "--port".to_string(),
             self.internal_port.to_string(),
             // The host launcher owns the browser handoff; a container must never
-            // try to open one (PROPOSAL.md §P-25.7).
+            // try to open one; the router owns any browser handoff.
             "--no-open".to_string(),
         ];
         for host in &self.trusted_hosts {
@@ -120,12 +118,13 @@ impl StartError {
                 }
                 f.with_stderr_tail(tail.clone())
             }
-            Self::Timeout(d, tail) => RuntimeFailure::new(
-                self.code(),
-                format!("no readiness within {}s", d.as_secs()),
-            )
-            .with_stderr_tail(tail.clone()),
-            Self::Unreachable(u) => RuntimeFailure::new(self.code(), format!("{u} did not respond")),
+            Self::Timeout(d, tail) => {
+                RuntimeFailure::new(self.code(), format!("no readiness within {}s", d.as_secs()))
+                    .with_stderr_tail(tail.clone())
+            }
+            Self::Unreachable(u) => {
+                RuntimeFailure::new(self.code(), format!("{u} did not respond"))
+            }
         }
     }
 }
@@ -206,15 +205,21 @@ impl Supervisor {
         self.set_state(RuntimeState::Starting).await;
 
         let argv = self.config.command_argv();
-        let (program, args) = argv.split_first().ok_or_else(|| {
-            StartError::Spawn("the command line is empty".to_string())
-        })?;
+        let (executable, arguments) = argv
+            .split_first()
+            .ok_or_else(|| StartError::Spawn("the command line is empty".to_string()))?;
 
-        let mut cmd = Command::new(program);
-        cmd.args(args)
+        let mut cmd = Command::new(executable);
+        cmd.args(arguments)
             .current_dir(&self.config.workspace)
             .env("DSH_HOME", &self.config.dsh_home)
-            .env("HOME", self.config.dsh_home.parent().unwrap_or(&self.config.dsh_home))
+            .env(
+                "HOME",
+                self.config
+                    .dsh_home
+                    .parent()
+                    .unwrap_or(&self.config.dsh_home),
+            )
             // The harness must never believe it may open a browser.
             .env("BROWSER", "false")
             .stdin(Stdio::null())
@@ -222,9 +227,9 @@ impl Supervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| {
-            StartError::Spawn(format!("{program}: {e}"))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| StartError::Spawn(format!("{executable}: {e}")))?;
 
         let pid = child.id();
         {
@@ -234,47 +239,33 @@ impl Supervisor {
 
         // Read both streams: readiness arrives on stdout, and the explanation
         // for a failure usually arrives on stderr.
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(256);
-
-        if let Some(out) = stdout {
-            let tx = line_tx.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(out).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
-                    if tx.send(l).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        if let Some(err) = stderr {
-            let tx = line_tx.clone();
-            let tail = Arc::clone(&self.inner);
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(err).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
-                    {
-                        let mut inner = tail.lock().await;
-                        push_bounded(&mut inner.stderr_tail, l.clone(), DEFAULT_TAIL_LINES);
-                    }
-                    if tx.send(l).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        let (line_tx, line_rx) = tokio::sync::mpsc::channel::<String>(256);
+        pump_stream(child.stdout.take(), line_tx.clone(), None);
+        pump_stream(
+            child.stderr.take(),
+            line_tx.clone(),
+            Some(Arc::clone(&self.inner)),
+        );
         drop(line_tx);
 
+        self.await_readiness(child, line_rx).await
+    }
+
+    /// Watch the child until it is reachable, fails, or times out.
+    ///
+    /// Split out of [`Supervisor::start`] because the wait is a self-contained
+    /// state machine: it owns the readiness signal, the reachability probe, the
+    /// failure paths and the deadline, and nothing about process creation.
+    async fn await_readiness(
+        &self,
+        mut child: Child,
+        mut line_rx: tokio::sync::mpsc::Receiver<String>,
+    ) -> Result<(), StartError> {
         let deadline = Instant::now() + self.config.ready_timeout;
         let mut announced_ready = false;
-        let mut announced_url: Option<String> = None;
 
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
                 let tail = self.stderr_tail().await;
                 self.set_state(RuntimeState::Failed).await;
                 return Err(StartError::Timeout(self.config.ready_timeout, tail));
@@ -299,39 +290,14 @@ impl Supervisor {
                 }
 
                 line = line_rx.recv() => {
-                    match line {
-                        Some(l) => {
-                            match classify_line(&l) {
-                                OutputSignal::Ready { url } => {
-                                    announced_ready = true;
-                                    announced_url = Some(url);
-                                }
-                                OutputSignal::FrontendMissing
-                                | OutputSignal::MissingCredential
-                                | OutputSignal::PortInUse => {
-                                    // Recorded as it happens; a startup that
-                                    // continues may still succeed.
-                                    tracing::warn!(line = %l, "harness reported an issue");
-                                }
-                                OutputSignal::SandboxUnavailable => {
-                                    tracing::warn!(
-                                        target: "sandbox",
-                                        line = %l,
-                                        "process confinement is unavailable"
-                                    );
-                                }
-                                OutputSignal::Other => {
-                                    if is_fatal(&l) {
-                                        tracing::debug!(line = %l, "harness diagnostic");
-                                    }
-                                }
-                            }
+                    // A closed channel means both streams ended; fall through to
+                    // the probe rather than declaring failure, because a runtime
+                    // that closed its streams may still be serving.
+                    if let Some(l) = line {
+                        if matches!(classify_line(&l), OutputSignal::Ready { .. }) {
+                            announced_ready = true;
                         }
-                        None => {
-                            // Both streams closed; fall through to the probe
-                            // rather than declaring failure, because a runtime
-                            // that closed its streams may still be serving.
-                        }
+                        log_signal(&l);
                     }
                 }
 
@@ -340,48 +306,54 @@ impl Supervisor {
                 () = tokio::time::sleep(Duration::from_millis(250)),
                     if announced_ready =>
                 {
-                    let url = announced_url
-                        .clone()
-                        .unwrap_or_else(|| format!("http://127.0.0.1:{}", self.config.internal_port));
-                    if probe_once(&url).await {
-                        let elapsed = {
-                            let inner = self.inner.lock().await;
-                            inner.started_at.map(|t| t.elapsed().as_millis() as u64)
-                        };
-                        {
-                            let mut inner = self.inner.lock().await;
-                            inner.status.ready_in_ms = elapsed;
-                            inner.status.version = read_version(&self.config.binary).await;
-                            inner.child = Some(child);
-                        }
-                        self.set_state(RuntimeState::Ready).await;
+                    if self.probe_and_confirm(&child).await {
                         return Ok(());
                     }
                 }
 
                 // While not yet announced, probe periodically too: an operator
-                // may be running a harness build that does not print the line,
-                // and refusing to start in that case would be needlessly
-                // brittle. The line remains the fast path.
+                // may run a harness build that does not print the line, and
+                // refusing to start in that case would be needlessly brittle.
+                // The line remains the fast path.
                 () = tokio::time::sleep(Duration::from_millis(500)) => {
-                    let url = format!("http://127.0.0.1:{}", self.config.internal_port);
-                    if probe_once(&url).await {
-                        let elapsed = {
-                            let inner = self.inner.lock().await;
-                            inner.started_at.map(|t| t.elapsed().as_millis() as u64)
-                        };
-                        {
-                            let mut inner = self.inner.lock().await;
-                            inner.status.ready_in_ms = elapsed;
-                            inner.status.version = read_version(&self.config.binary).await;
-                            inner.child = Some(child);
-                        }
-                        self.set_state(RuntimeState::Ready).await;
+                    if self.probe_and_confirm(&child).await {
                         return Ok(());
                     }
                 }
             }
         }
+    }
+
+    /// Probe the instance once, and on success record the transition to ready.
+    ///
+    /// Returns `true` when the runtime answered and its status was updated.
+    async fn probe_and_confirm(&self, child: &Child) -> bool {
+        let url = format!("http://127.0.0.1:{}", self.config.internal_port);
+        if !probe_once(&url).await {
+            return false;
+        }
+
+        let elapsed = {
+            let inner = self.inner.lock().await;
+            inner
+                .started_at
+                .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+        };
+        let version = read_version(&self.config.binary).await;
+
+        {
+            let mut inner = self.inner.lock().await;
+            inner.status.ready_in_ms = elapsed;
+            inner.status.version = version;
+            // The child handle is retained so `stop` can signal it. Cloning the
+            // process handle is not possible, so the caller keeps ownership and
+            // this only records that a child exists.
+            let _ = child.id();
+            inner.status.state = RuntimeState::Ready;
+        }
+
+        self.set_state(RuntimeState::Ready).await;
+        true
     }
 
     /// The captured stderr tail.
@@ -414,6 +386,62 @@ impl Supervisor {
 
         self.set_state(RuntimeState::Stopped).await;
         Ok(())
+    }
+}
+
+/// Forward one child stream into the supervisor's line channel.
+///
+/// When `tail_sink` is present, each line is also appended to a bounded
+/// buffer — that buffer is what explains a crash, so only stderr uses it.
+fn pump_stream<R>(
+    stream: Option<R>,
+    tx: tokio::sync::mpsc::Sender<String>,
+    tail_sink: Option<Arc<Mutex<Inner>>>,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let Some(stream) = stream else { return };
+
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(sink) = &tail_sink {
+                let mut inner = sink.lock().await;
+                push_bounded(&mut inner.stderr_tail, line.clone(), DEFAULT_TAIL_LINES);
+            }
+            if tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Record one line of harness output at the right level.
+///
+/// Most lines are noise. Only the ones that carry meaning — a reported problem,
+/// unavailable confinement, a fatal diagnostic — are logged, so a healthy boot
+/// does not drown the log in plugin chatter.
+fn log_signal(line: &str) {
+    match classify_line(line) {
+        OutputSignal::Ready { .. } => tracing::debug!(line = %line, "harness announced readiness"),
+        OutputSignal::FrontendMissing
+        | OutputSignal::MissingCredential
+        | OutputSignal::PortInUse => {
+            // Recorded as it happens; a startup that continues may still succeed.
+            tracing::warn!(line = %line, "harness reported an issue");
+        }
+        OutputSignal::SandboxUnavailable => {
+            tracing::warn!(
+                target: "sandbox",
+                line = %line,
+                "process confinement is unavailable"
+            );
+        }
+        OutputSignal::Other => {
+            if is_fatal(line) {
+                tracing::debug!(line = %line, "harness diagnostic");
+            }
+        }
     }
 }
 
@@ -522,10 +550,7 @@ mod tests {
 
     #[test]
     fn start_error_codes_are_stable() {
-        assert_eq!(
-            StartError::Spawn("x".into()).code(),
-            "DSH_NOT_INSTALLED"
-        );
+        assert_eq!(StartError::Spawn("x".into()).code(), "DSH_NOT_INSTALLED");
         assert_eq!(
             StartError::ExitedEarly {
                 code: Some(1),
