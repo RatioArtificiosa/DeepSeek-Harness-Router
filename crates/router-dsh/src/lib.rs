@@ -26,12 +26,14 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod multi;
+pub mod process;
 pub mod provisioning;
 pub mod readiness;
 pub mod state;
 pub mod supervisor;
 
 pub use multi::{InstanceError, InstanceSpec, MultiConfig, MultiSupervisor};
+pub use process::{is_command_script, kill_tree};
 pub use provisioning::{provision, settings_document, split_model, ProvisionReport};
 pub use readiness::{classify_line, OutputSignal};
 pub use state::{RuntimeFailure, RuntimeState, RuntimeStatus};

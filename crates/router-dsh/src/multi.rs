@@ -481,10 +481,11 @@ impl MultiSupervisor {
         let grace = self.config.stop_grace;
         let mut guard = slot.lock().await;
         if let Some(child) = guard.child.as_mut() {
-            let _ = child.start_kill();
-            if tokio::time::timeout(grace, child.wait()).await.is_err() {
-                let _ = child.kill().await;
-            }
+            // A tree kill: the child handle may belong to a Windows `cmd.exe`
+            // shim while the harness runs as its grandchild. Killing only the
+            // handle leaves the harness holding its port while this function
+            // reports success. See `crate::process`.
+            crate::process::kill_tree(child, grace).await;
         }
         guard.child = None;
         guard.status.pid = None;

@@ -456,7 +456,7 @@ async fn start_one(
         .ok_or_else(|| unknown_instance(name, registry))?;
     let spec = InstanceSpec::from_registry(name, instance, home.root());
 
-    let supervisor = build_supervisor();
+    let supervisor = build_supervisor()?;
     supervisor.register(spec).await;
 
     if style.verbosity == Verbosity::Verbose {
@@ -515,28 +515,35 @@ async fn start_one(
 }
 
 async fn cmd_stop(style: &Style, name: &str, all: bool) -> Result<ExitCode, Failure> {
-    let (home, registry) = load(None)?;
-    let supervisor = build_supervisor();
+    // Only the registry is needed: stopping works from the port, so nothing here
+    // depends on the router home or on a supervisor that this process does not
+    // own.
+    let (_, registry) = load(None)?;
 
     if all {
+        let mut failures = Vec::new();
+        let mut stopped = 0usize;
         for n in registry.names() {
             let instance = registry.get(n).expect("name came from the registry");
-            supervisor
-                .register(InstanceSpec::from_registry(n, instance, home.root()))
-                .await;
+            // By port, not by child handle: this process did not start the
+            // harness. See `stop_instance`.
+            if stop_instance(instance.port).await {
+                stopped += 1;
+            } else {
+                failures.push(n.to_string());
+            }
         }
-        let failures = supervisor.stop_all().await;
-        for (n, e) in &failures {
-            term::err(&style.warn(&format!("{n} did not stop cleanly: {e}")));
+        for n in &failures {
+            term::err(&style.warn(&format!("{n} is still holding its port")));
         }
         if failures.is_empty() {
             if style.verbosity != Verbosity::Quiet {
-                term::out(&style.ok("All instances stopped"));
+                term::out(&style.ok(&format!("Stopped {stopped} instance(s)")));
             }
             return Ok(ExitCode::SUCCESS);
         }
         return Err(Failure::runtime(
-            format!("{} instance(s) did not stop", failures.len()),
+            format!("{} instance(s) could not be stopped", failures.len()),
             "Check for orphaned processes with `router doctor`.",
         ));
     }
@@ -545,16 +552,16 @@ async fn cmd_stop(style: &Style, name: &str, all: bool) -> Result<ExitCode, Fail
         return Err(unknown_instance(name, &registry));
     }
     let instance = registry.get(name).expect("checked above");
-    supervisor
-        .register(InstanceSpec::from_registry(name, instance, home.root()))
-        .await;
 
-    supervisor.stop(name).await.map_err(|e| {
-        Failure::runtime(
-            e.to_string(),
-            "Check the process with `router doctor`.".to_string(),
-        )
-    })?;
+    if !stop_instance(instance.port).await {
+        // Reporting success here would be the worst outcome: the user stops
+        // looking while the harness keeps the port, and the next start fails
+        // for a reason nothing on screen explains.
+        return Err(Failure::runtime(
+            format!("{name} is still listening on port {}", instance.port),
+            "The process could not be stopped. Run `router doctor` to see it.",
+        ));
+    }
 
     if style.verbosity != Verbosity::Quiet {
         term::out(&style.ok(&format!("Stopped {}", style.strong(name))));
@@ -566,13 +573,29 @@ async fn cmd_stop(style: &Style, name: &str, all: bool) -> Result<ExitCode, Fail
     Ok(ExitCode::SUCCESS)
 }
 
+/// Stop whatever holds an instance's port.
+///
+/// # Why the port, and not a child handle
+///
+/// `stop` runs in a different process from `start`. The supervisor that spawned
+/// the harness is in the other one, so this process has no child to signal — and
+/// a supervisor asked to stop an instance it never started would do nothing and
+/// report success. The harness's port is the one fact both processes agree on,
+/// and holding it is the whole reason the harness is running.
+///
+/// Returns `true` when nothing is listening afterwards, which includes the
+/// already-stopped case: "make it not run" is satisfied either way.
+async fn stop_instance(port: u16) -> bool {
+    router_dsh::process::stop_listener_on(port, std::time::Duration::from_secs(5)).await
+}
+
 async fn cmd_restart(style: &Style, name: &str) -> Result<ExitCode, Failure> {
     let (home, registry) = load(None)?;
     if !registry.contains(name) {
         return Err(unknown_instance(name, &registry));
     }
 
-    let supervisor = build_supervisor();
+    let supervisor = build_supervisor()?;
     let instance = registry.get(name).expect("checked above");
     supervisor
         .register(InstanceSpec::from_registry(name, instance, home.root()))
@@ -733,7 +756,7 @@ async fn cmd_logs(style: &Style, name: &str) -> Result<ExitCode, Failure> {
         return Err(unknown_instance(name, &registry));
     }
 
-    let supervisor = build_supervisor();
+    let supervisor = build_supervisor()?;
     let instance = registry.get(name).expect("checked above");
     supervisor
         .register(InstanceSpec::from_registry(name, instance, home.root()))
@@ -891,12 +914,37 @@ async fn cmd_doctor(style: &Style) -> Result<ExitCode, Failure> {
 // helpers
 // ─────────────────────────────────────────────────────────────────────────
 
-fn build_supervisor() -> MultiSupervisor {
-    let binary = std::env::var("DSH_BINARY").unwrap_or_else(|_| "dsh".to_string());
-    MultiSupervisor::new(MultiConfig {
-        binary: PathBuf::from(binary),
-        ..MultiConfig::default()
+/// Build a supervisor, resolving the harness the same way `doctor` does.
+///
+/// # Why this resolves rather than passing the name through
+///
+/// On Windows the installed harness is a `.cmd` shim. `Command::new("dsh")` does
+/// not find it: process spawning does not consult `PATHEXT`, so only an exact
+/// filename or an executable works. The bare name would therefore start nothing,
+/// and the failure surfaced as `DSH_NOT_INSTALLED` — "program not found" — while
+/// `doctor` happily reported the harness present. Two commands disagreeing about
+/// whether the product is installed is worse than either answer alone.
+///
+/// `DSH_BINARY` still wins when set, so an explicit choice is never overridden.
+/// Resolution is fallible on purpose: a missing harness is a real error with a
+/// real remedy, and it is raised where the user asked for something that needs
+/// one, rather than deferred to a spawn failure that reads as a mystery.
+fn resolve_harness() -> Result<PathBuf, Failure> {
+    let requested = std::env::var("DSH_BINARY").unwrap_or_else(|_| "dsh".to_string());
+    which(&requested).ok_or_else(|| {
+        Failure::runtime(
+            format!("cannot find the harness executable '{requested}'"),
+            "Install it, or set DSH_BINARY to its full path. \
+             Run `router doctor` to see what is detected.",
+        )
     })
+}
+
+fn build_supervisor() -> Result<MultiSupervisor, Failure> {
+    Ok(MultiSupervisor::new(MultiConfig {
+        binary: resolve_harness()?,
+        ..MultiConfig::default()
+    }))
 }
 
 fn unknown_instance(name: &str, registry: &Registry) -> Failure {

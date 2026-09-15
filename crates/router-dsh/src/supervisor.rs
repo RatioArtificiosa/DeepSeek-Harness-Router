@@ -372,13 +372,11 @@ impl Supervisor {
 
         let mut inner = self.inner.lock().await;
         if let Some(child) = inner.child.as_mut() {
-            let _ = child.start_kill();
-            match tokio::time::timeout(grace, child.wait()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    let _ = child.kill().await;
-                }
-            }
+            // A tree kill, not a handle kill: on Windows the handle belongs to a
+            // `cmd.exe` shim and the harness is its grandchild, so killing the
+            // handle alone leaves the harness running while reporting success.
+            // See `crate::process` for the full account.
+            crate::process::kill_tree(child, grace).await;
         }
         inner.child = None;
         inner.status.pid = None;

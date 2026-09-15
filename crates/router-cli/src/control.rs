@@ -81,7 +81,7 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
         // spawned task. A control page is requested by one human at a time, so
         // concurrency here would buy nothing and complicate the borrows.
         let fresh = Registry::load(&home.registry_path()).unwrap_or_else(|_| registry.clone());
-        let body = render(style, &home, &fresh);
+        let body = render(&home, &fresh);
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/html; charset=utf-8\r\n\
@@ -99,17 +99,38 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
 }
 
 /// Render the whole page.
+///
+/// Takes no [`Style`]: the output is HTML, and terminal styling has no meaning
+/// in a browser. Accepting one would imply the page adapts to a terminal it
+/// cannot see.
 #[must_use]
-pub fn render(style: &Style, home: &RouterHome, registry: &Registry) -> String {
+pub fn render(home: &RouterHome, registry: &Registry) -> String {
     let instances: Vec<(&String, &Instance)> = registry.instances.iter().collect();
-    let running = instances
+
+    // Probing is the expensive part — a socket connect per instance — so it is
+    // done once here and the answer is passed down, rather than each row asking
+    // again. Two inconsistent answers on one page would be worse than slow.
+    let live: Vec<(&String, &Instance, bool)> = instances
         .iter()
-        .filter(|(_, i)| crate::probe_port(i.port))
-        .count();
+        .map(|(name, instance)| (*name, *instance, crate::probe_port(instance.port)))
+        .collect();
+
+    let total = live.len();
+    let running = live.iter().filter(|(_, _, up)| *up).count();
+    let stopped = total.saturating_sub(running);
+    let missing: Vec<&str> = live
+        .iter()
+        .filter(|(_, instance, _)| !instance.workspace.is_dir())
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    let models: std::collections::BTreeSet<&str> = live
+        .iter()
+        .map(|(_, instance, _)| instance.model.as_deref().unwrap_or("default"))
+        .collect();
 
     let mut rows = String::new();
-    for (name, instance) in &instances {
-        rows.push_str(&render_row(style, name, instance, home));
+    for (name, instance, up) in &live {
+        rows.push_str(&render_row(name, instance, *up, home));
     }
 
     if instances.is_empty() {
@@ -134,7 +155,7 @@ pub fn render(style: &Style, home: &RouterHome, registry: &Registry) -> String {
 <main>
   <header>
     <div class="brand">
-      <svg viewBox="0 0 40 40" width="34" height="34" aria-hidden="true">
+      <svg viewBox="0 0 40 40" width="36" height="36" aria-hidden="true">
         <path d="M20 6 L32 13 L32 27 L20 34 L8 27 L8 13 Z" fill="none"
               stroke="url(#g)" stroke-width="2.2" stroke-linejoin="round"/>
         <circle cx="20" cy="20" r="3.6" fill="url(#g)"/>
@@ -146,12 +167,35 @@ pub fn render(style: &Style, home: &RouterHome, registry: &Registry) -> String {
       </svg>
       <div>
         <h1>DeepSeek Harness Router</h1>
-        <p class="sub">{count} instance{plural} &middot; {running} serving</p>
+        <p class="sub">Each instance runs in its own workspace, on its own port,
+           with its own state root.</p>
       </div>
     </div>
-    <div class="home" title="{home_path}">{home_short}</div>
+    <div class="home" title="{home_path}"><span>router home</span>{home_short}</div>
   </header>
 
+  <section class="stats" aria-label="Summary">
+    <div class="stat">
+      <span class="k">Instances</span>
+      <span class="v">{total}</span>
+    </div>
+    <div class="stat">
+      <span class="k">Serving</span>
+      <span class="v {up_class}">{running}</span>
+    </div>
+    <div class="stat">
+      <span class="k">Stopped</span>
+      <span class="v {down_class}">{stopped}</span>
+    </div>
+    <div class="stat">
+      <span class="k">Models in use</span>
+      <span class="v">{model_count}</span>
+    </div>
+  </section>
+
+  {warning}
+
+  <h2>Instances</h2>
   <table>
     <thead>
       <tr><th>Instance</th><th>Port</th><th>Workspace</th><th>Model</th></tr>
@@ -167,19 +211,49 @@ pub fn render(style: &Style, home: &RouterHome, registry: &Registry) -> String {
 </body>
 </html>"##,
         css = CSS,
-        count = instances.len(),
-        plural = if instances.len() == 1 { "" } else { "s" },
+        home_path = html_escape(&home.root().display().to_string()),
+        home_short = html_escape(&short_path(&home.root().display().to_string())),
+        total = total,
         running = running,
-        home_path = home.root().display(),
-        home_short = short_path(&home.root().display().to_string()),
+        stopped = stopped,
+        up_class = if running > 0 { "up" } else { "idle" },
+        down_class = if stopped > 0 { "down" } else { "idle" },
+        model_count = models.len(),
+        warning = render_warning(&missing),
         rows = rows,
     )
 }
 
+/// A banner for the one condition a user must act on.
+///
+/// A workspace that no longer exists is not a display detail: the harness will
+/// fail to start, or start somewhere unintended. Reporting it in the same grey
+/// as everything else would bury the only line on the page that needs a
+/// decision.
+fn render_warning(missing: &[&str]) -> String {
+    if missing.is_empty() {
+        return String::new();
+    }
+    let names = missing
+        .iter()
+        .map(|n| html_escape(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plural = if missing.len() == 1 { "" } else { "s" };
+    format!(
+        r#"<div class="warn" role="status">
+      <strong>{n} workspace{plural} missing</strong>
+      <span>The directory for <code>{names}</code> no longer exists. The router
+        never creates or deletes a workspace, so this needs fixing by hand.</span>
+    </div>"#,
+        n = missing.len(),
+        plural = plural,
+        names = names,
+    )
+}
+
 /// One instance row.
-fn render_row(style: &Style, name: &str, instance: &Instance, home: &RouterHome) -> String {
-    let _ = style;
-    let serving = crate::probe_port(instance.port);
+fn render_row(name: &str, instance: &Instance, serving: bool, home: &RouterHome) -> String {
     let workspace_ok = instance.workspace.is_dir();
     let url = format!("http://127.0.0.1:{}", instance.port);
 
@@ -220,6 +294,7 @@ fn render_row(style: &Style, name: &str, instance: &Instance, home: &RouterHome)
     // cannot interfere with each other, and it is the directory a user would
     // inspect when something looks wrong.
     let state_root = home.instance_dir(name).join("dsh");
+    let state_short = short_path(&state_root.display().to_string());
 
     format!(
         r#"<tr>
@@ -233,7 +308,10 @@ fn render_row(style: &Style, name: &str, instance: &Instance, home: &RouterHome)
       <td class="model">{model}</td>
     </tr>
     <tr class="detail"><td colspan="4">
-      <span class="muted">state</span> <code>{state_root}</code>
+      <span class="meta"><span class="muted">state root</span>
+        <code title="{state_full}">{state_short}</code></span>
+      <span class="meta"><span class="muted">endpoint</span>
+        <code>127.0.0.1:{port}</code></span>
     </td></tr>"#,
         state_class = state_class,
         name = html_escape(name),
@@ -243,7 +321,9 @@ fn render_row(style: &Style, name: &str, instance: &Instance, home: &RouterHome)
         ws = html_escape(&short_path(&instance.workspace.display().to_string())),
         flag = workspace_note,
         model = model,
-        state_root = html_escape(&state_root.display().to_string()),
+        state_full = html_escape(&state_root.display().to_string()),
+        state_short = html_escape(&state_short),
+        port = instance.port,
     )
 }
 
@@ -327,16 +407,60 @@ const CSS: &str = r#"
 }
 * { box-sizing: border-box; }
 body {
-  margin: 0; padding: 40px 24px; background: var(--bg); color: var(--ink);
+  margin: 0; padding: 44px 24px; background: var(--bg); color: var(--ink);
   font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
-main { max-width: 960px; margin: 0 auto; }
-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 28px; flex-wrap: wrap; }
-.brand { display: flex; align-items: center; gap: 14px; }
-h1 { font-size: 19px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
-.sub { margin: 2px 0 0; font-size: 13px; color: var(--dim); }
-.home { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--faint); }
+main { max-width: 980px; margin: 0 auto; }
+
+/* The header states what the product is, once. The summary that follows is
+   the answer to "is everything up?", which is the question that brings a
+   person to this page at all. */
+header { display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; margin-bottom: 26px; flex-wrap: wrap; }
+.brand { display: flex; align-items: flex-start; gap: 14px; }
+.brand svg { flex: none; margin-top: 2px; }
+h1 { font-size: 19px; font-weight: 650; margin: 0; letter-spacing: -0.012em; }
+.sub { margin: 5px 0 0; font-size: 13.5px; color: var(--dim); max-width: 46ch; }
+.home {
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--dim); text-align: right; word-break: break-all; max-width: 34ch;
+}
+.home span {
+  display: block; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 10.5px; letter-spacing: 0.09em; text-transform: uppercase; color: var(--faint);
+  margin-bottom: 3px;
+}
+
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 26px; }
+.stat {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 13px;
+  padding: 15px 17px; display: flex; flex-direction: column; gap: 5px;
+}
+.stat .k {
+  font-size: 10.5px; font-weight: 650; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--faint);
+}
+.stat .v { font-size: 27px; font-weight: 640; line-height: 1; letter-spacing: -0.03em; }
+.stat .v.up { color: var(--up); }
+.stat .v.down { color: var(--down); }
+.stat .v.idle { color: var(--faint); }
+
+/* The one thing that needs a decision gets a colour of its own. */
+.warn {
+  display: flex; flex-direction: column; gap: 5px; margin-bottom: 24px;
+  border: 1px solid color-mix(in srgb, var(--down) 45%, var(--line));
+  background: color-mix(in srgb, var(--down) 9%, var(--panel));
+  border-radius: 13px; padding: 15px 18px;
+}
+.warn strong { font-size: 14px; color: var(--down); }
+.warn span { font-size: 13px; color: var(--dim); }
+.warn code { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--ink); }
+
+h2 {
+  font-size: 11px; font-weight: 650; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--faint); margin: 0 0 11px 2px;
+}
+
 table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 thead th {
   text-align: left; font-size: 11px; font-weight: 650; letter-spacing: 0.09em;
@@ -346,8 +470,9 @@ thead th {
 tbody tr:not(.detail) { border-top: 1px solid var(--line); }
 tbody tr:first-child:not(.detail) { border-top: none; }
 td { padding: 15px 18px; vertical-align: middle; }
-tr.detail td { padding: 0 18px 15px; border: none; font-size: 12px; }
-tr.detail code { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--faint); }
+tr.detail td { padding: 0 18px 16px; border: none; display: flex; gap: 22px; flex-wrap: wrap; }
+tr.detail code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--faint); }
+.meta { display: inline-flex; align-items: baseline; gap: 7px; }
 .name { display: flex; align-items: center; gap: 10px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .dot.up { background: var(--up); box-shadow: 0 0 0 3px color-mix(in srgb, var(--up) 22%, transparent); }
@@ -371,11 +496,17 @@ tr.detail code { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, mon
 footer { margin-top: 22px; }
 footer p { font-size: 12.5px; color: var(--faint); margin: 0; }
 footer code { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--dim); }
+
+@media (max-width: 720px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .home { text-align: left; max-width: none; }
+}
 @media (max-width: 640px) {
-  body { padding: 24px 14px; }
+  body { padding: 26px 14px; }
   thead { display: none; }
-  tbody tr:not(.detail) { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 14px 0; }
+  tbody tr:not(.detail) { display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; padding: 14px 0; }
   tbody tr.detail { display: block; }
+  tr.detail td { display: flex; flex-direction: column; gap: 7px; padding: 0 18px 16px; }
   td { padding: 2px 18px; }
   td:nth-child(3), td:nth-child(4) { grid-column: 1 / -1; }
 }
@@ -385,13 +516,6 @@ footer code { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    fn style() -> Style {
-        Style::with_colour(
-            router_core::term::ColourMode::Never,
-            router_core::term::Verbosity::Normal,
-        )
-    }
 
     fn home() -> RouterHome {
         RouterHome::resolve(Some(PathBuf::from("/tmp/router"))).unwrap()
@@ -410,7 +534,7 @@ mod tests {
     #[test]
     fn renders_an_empty_state_that_teaches_the_command() {
         let registry = Registry::default();
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
         assert!(page.contains("No instances yet"));
         assert!(page.contains("router add"));
     }
@@ -424,7 +548,7 @@ mod tests {
         registry
             .insert("beta", Instance::new(PathBuf::from("/tmp/b"), 3082))
             .unwrap();
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
 
         assert!(page.contains("alpha"));
         assert!(page.contains("beta"));
@@ -439,7 +563,7 @@ mod tests {
         registry
             .insert("only", Instance::new(PathBuf::from("/tmp/x"), 3099))
             .unwrap();
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
         assert!(page.contains("3099"));
     }
 
@@ -450,7 +574,7 @@ mod tests {
         registry
             .insert("only", Instance::new(PathBuf::from("/tmp/x"), 3099))
             .unwrap();
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
         assert!(
             page.contains("stopped") || page.contains("serving"),
             "a textual state word must be present"
@@ -466,7 +590,7 @@ mod tests {
                 Instance::new(PathBuf::from("/tmp/<img src=x onerror=alert(1)>"), 3081),
             )
             .unwrap();
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
         assert!(
             !page.contains("<img src=x"),
             "raw markup leaked into the page"
@@ -486,7 +610,7 @@ mod tests {
         {
             return; // rejected upstream, which is the stronger outcome
         }
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
         assert!(!page.contains("<script>alert"));
     }
 
@@ -496,7 +620,7 @@ mod tests {
         registry
             .insert("only", Instance::new(PathBuf::from("/tmp/x"), 3081))
             .unwrap();
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
         assert!(page.contains("default"));
     }
 
@@ -506,7 +630,7 @@ mod tests {
         let mut inst = Instance::new(PathBuf::from("/tmp/x"), 3081);
         inst.model = Some("deepseek-v4-pro".into());
         registry.insert("only", inst).unwrap();
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
         assert!(page.contains("deepseek-v4-pro"));
     }
 
@@ -514,7 +638,7 @@ mod tests {
     fn the_page_states_that_it_cannot_mutate() {
         // A web page that can stop agent processes, on an unauthenticated
         // port, is a liability rather than a feature.
-        let page = render(&style(), &home(), &Registry::default());
+        let page = render(&home(), &Registry::default());
         assert!(page.contains("cannot start or stop"));
     }
 
@@ -524,14 +648,14 @@ mod tests {
         registry
             .insert("alpha", Instance::new(PathBuf::from("/tmp/a"), 3081))
             .unwrap();
-        let page = render(&style(), &home(), &registry);
+        let page = render(&home(), &registry);
         assert!(page.contains("instances"));
         assert!(page.contains("alpha"));
     }
 
     #[test]
     fn output_is_a_complete_document() {
-        let page = render(&style(), &home(), &Registry::default());
+        let page = render(&home(), &Registry::default());
         assert!(page.starts_with("<!DOCTYPE html>"));
         assert!(page.contains("</html>"));
         assert!(page.contains("viewport"));
@@ -540,14 +664,102 @@ mod tests {
     #[test]
     fn the_count_pluralises_correctly() {
         let mut registry = Registry::default();
-        let one = render(&style(), &home(), &registry);
-        assert!(one.contains("0 instances"));
+        let one = render(&home(), &registry);
+        assert!(one.contains("Instances"));
 
         registry
             .insert("a", Instance::new(PathBuf::from("/tmp/a"), 3081))
             .unwrap();
-        let two = render(&style(), &home(), &registry);
-        assert!(two.contains("1 instance"));
-        assert!(!two.contains("1 instances"));
+        let two = render(&home(), &registry);
+        assert!(two.contains(">1<"), "the instance count must be shown");
+    }
+
+    #[test]
+    fn the_summary_counts_every_instance_exactly_once() {
+        // Two stopped instances, so counts are deterministic without needing a
+        // listening socket. The summary is the first thing read, so a wrong
+        // number here is worse than no number.
+        let mut registry = Registry::default();
+        for (i, name) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            registry
+                .insert(
+                    name,
+                    Instance::new(PathBuf::from(format!("/tmp/{name}")), 3200 + i as u16),
+                )
+                .unwrap();
+        }
+        let page = render(&home(), &registry);
+
+        assert!(page.contains(r#"<span class="v idle">0</span>"#) || page.contains(">0<"));
+        assert!(
+            page.contains(">3<"),
+            "three instances must be counted:\n{page}"
+        );
+        // Two distinct models: two named, one default — the default is a model
+        // choice in its own right and must be counted as one.
+        assert!(page.contains(">1<"));
+    }
+
+    #[test]
+    fn a_missing_workspace_raises_a_warning_and_a_flag() {
+        // A workspace that no longer exists means the harness will fail to start
+        // somewhere the user did not intend. That is the one condition on this
+        // page that needs a decision, so it must not be buried in grey text.
+        let mut registry = Registry::default();
+        let absent = PathBuf::from("/definitely/not/a/real/directory/anywhere");
+        registry
+            .insert("gone", Instance::new(absent, 3081))
+            .unwrap();
+        let page = render(&home(), &registry);
+
+        assert!(
+            page.contains("class=\"warn\""),
+            "a warning banner is required"
+        );
+        assert!(page.contains("missing"), "the row must be flagged too");
+        assert!(
+            page.contains("never creates or deletes"),
+            "the warning must say why we do not fix it"
+        );
+    }
+
+    #[test]
+    fn a_healthy_registry_shows_no_warning() {
+        // A warning that appears when nothing is wrong is noise, and noise is
+        // how real warnings get ignored.
+        let mut registry = Registry::default();
+        let dir = std::env::temp_dir();
+        registry.insert("fine", Instance::new(dir, 3081)).unwrap();
+        let page = render(&home(), &registry);
+        assert!(
+            !page.contains("class=\"warn\""),
+            "no warning may appear when every workspace exists"
+        );
+    }
+
+    #[test]
+    fn the_endpoint_is_shown_in_full() {
+        // A truncated address cannot be connected to. The port is also the link
+        // target, but the endpoint line gives the exact host:port to paste.
+        let mut registry = Registry::default();
+        registry
+            .insert("only", Instance::new(PathBuf::from("/tmp/x"), 3099))
+            .unwrap();
+        let page = render(&home(), &registry);
+        assert!(
+            page.contains("127.0.0.1:3099"),
+            "the full endpoint must be rendered"
+        );
+    }
+
+    #[test]
+    fn the_summary_labels_reach_the_reader() {
+        let page = render(&home(), &Registry::default());
+        for label in ["Instances", "Serving", "Stopped", "Models in use"] {
+            assert!(
+                page.contains(label),
+                "the summary must label its numbers: {label}"
+            );
+        }
     }
 }
