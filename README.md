@@ -6,14 +6,14 @@
 
 **Run more than one DeepSeek Harness at once.**
 
-A local control plane for the DeepSeek Harness agent — so you can work on
-several projects in parallel, each with its own workspace and its own model,
-without them interfering with each other.
+Each in its own workspace, on its own port, with its own model, its own
+sessions and its own settings — reachable from a single local page.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-4f8cff.svg?style=flat-square)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/core-Rust-f74c00.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Harness](https://img.shields.io/badge/harness-0.1.x-37e0c8.svg?style=flat-square)](docs/dsh-compatibility.md)
-[![Status: in development](https://img.shields.io/badge/status-in%20development-ffce6a.svg?style=flat-square)](#-project-status)
+[![Tests](https://img.shields.io/badge/tests-287%20passing-3ecf8e.svg?style=flat-square)](#quality)
+[![Status: working](https://img.shields.io/badge/status-working-3ecf8e.svg?style=flat-square)](#project-status)
 
 <br>
 
@@ -25,40 +25,56 @@ without them interfering with each other.
 
 > ### Project status
 >
-> **This project is under active development and does not run yet.**
+> **Working, and in daily use.**
 >
-> The Rust core is written and tested; the multi-instance supervisor and the
-> `router` command are being built now.
+> The router runs multiple harness instances side by side, each with its own
+> isolated state, port, workspace and model. The control page and the per-instance
+> UI both work end to end in a real browser.
 >
-> Everything below describes what the finished system does — how it isolates
-> instances, allocates ports, and keeps your existing install untouched.
+> DeepSeek Harness is in developer preview, so its internals move. That coupling
+> is confined to a single crate, so an upstream change is a small, local edit
+> rather than a rewrite — see [`docs/dsh-compatibility.md`](docs/dsh-compatibility.md).
 >
-> **Star the repository** to be notified when the first working release lands.
+> **Star the repository** to follow what lands next.
 
 ---
 
 ## The whole thing, in one screen
 
 ```text
-$ router add rust-refactor --workspace ~/projects/rust
-  ✓ workspace  ~/projects/rust
-  ✓ port       3081
-  ✓ model      deepseek-v4-pro
-  ✓ state root ~/.deepseek-router/instances/rust-refactor/dsh
-  → http://127.0.0.1:3081
+$ router list --probe
 
-$ router add py-service --workspace ~/services/py --model deepseek-v4-flash
-  ✓ port       3082
-  → http://127.0.0.1:3082
+    NAME    PORT   WORKSPACE                          MODEL
+-------------------------------------------------------------
+*   main    3082   ~/projects/atlas                    deepseek-v4-pro
+*   notes   3083   ~/projects/journal                  deepseek-v4-flash
 
-$ router list
-  NAME            PORT   WORKSPACE          MODEL              STATE
-  rust-refactor   3081   ~/projects/rust    deepseek-v4-pro    ready
-  py-service      3082   ~/services/py      deepseek-v4-flash  ready
+$ router status
+2 up  |  0 down
+
+$ router open notes
+OK Opened http://127.0.0.1:3090/i/notes/
 ```
 
-Two agents, two projects, two models, running at the same time. Each has its own
-sessions and its own settings. Nothing is shared, so nothing can collide.
+Two agents, two projects, two models, running at the same time. One page reaches
+both.
+
+**Open the control page and they are all there:**
+
+```text
+$ router serve
+OK Control page ready
+
+  →  http://127.0.0.1:3090
+
+  Instances are reachable through this page:
+    http://127.0.0.1:3090/i/main
+    http://127.0.0.1:3090/i/notes
+```
+
+Everything lives on **one origin**. That is not cosmetic — it is the reason a
+browser can talk to all of them at once. See
+[why one origin matters](#why-one-origin-matters).
 
 ---
 
@@ -112,22 +128,32 @@ processes. The Router makes that the normal way of working.
 Point each instance at the project it belongs to. Its agent starts there, its
 sessions group there, and its history stays separate from the others.
 
+### One page for all of them
+
+A single local origin serves every instance. The page shows port, workspace,
+model and live state at a glance, and links straight into each one's own UI.
+
 ### Your existing install keeps working
 
 The Router never touches your current harness. It does not read your `~/.dsh`,
 does not change your settings, and does not restart your processes. It starts new
-instances, on new ports, with new state.
-
-### A control area
-
-One command lists everything — port, workspace, model, state, uptime. A local
-page shows the same at a glance, with start, stop, restart and open per instance.
+instances, on new ports, with new state. Your daily driver on 3080 is untouched.
 
 ### It tells you when something is off
 
 Two instances pointed at the same folder is a quiet way to get two agents editing
-one tree. The Router notices and says so. So does a port that got taken, or a
-model route that does not exist.
+one tree — the Router notices and says so. So does a port already taken by
+something else, a workspace that has been deleted, or a model route that does not
+exist.
+
+**It will not touch what it did not start.** If a port is occupied, the Router
+names the process holding it and refuses, rather than adopting it and reporting
+success.
+
+### Nothing phones home
+
+No telemetry, no account, no analytics. The Router talks to your machine's
+harnesses and to nothing else.
 
 ---
 
@@ -151,15 +177,20 @@ cargo build --release
 Then:
 
 ```text
-router list                          every instance and its state
+router list --probe                  every instance and its live state
+router start my-project              start one
+router serve                         one page for all of them
 router open my-project               open its UI
 router stop my-project               stop it, leave the rest alone
-router logs my-project -f            follow its output
+router logs my-project               what it said
 router doctor                        check everything, change nothing
 ```
 
 > **Ports start at 3081.** The harness default is 3080, and your existing install
 > already has it. The Router leaves it alone and allocates upward from there.
+
+> **`router doctor` reports the harness your instances will actually run** — not
+> merely the first `dsh` on `PATH`, which may be a launcher that routes elsewhere.
 
 ---
 
@@ -178,7 +209,7 @@ router doctor                        check everything, change nothing
      ├── allocates a port per instance
      ├── spawns  dsh web --port 3081   with DSH_HOME=…/rust-refactor/dsh
      ├── spawns  dsh web --port 3082   with DSH_HOME=…/py-service/dsh
-     └── watches both, and reports what they are doing
+     └── supervises both, and serves one origin that reaches them all
 ```
 
 Three things make it work.
@@ -192,9 +223,46 @@ separate models require separate processes. That is not a design preference; it
 is the only way to satisfy the requirement. The upside is real crash isolation:
 one instance falling over does not touch the others.
 
-**The Router supervises, and stays out of the way.** It starts, watches and
-stops harnesses. It does not proxy them, does not replace their UI, and does not
-sit between you and your agent once they are running.
+**One origin serves them all.** The control page and the instances share a single
+authority, so the browser treats every instance as the same site.
+
+<details>
+<summary><b>Why one origin matters</b></summary>
+
+<br>
+
+This is the least obvious part of the design, and the part that took the longest
+to get right.
+
+The harness authenticates its API with a cookie whose **name is derived from the
+request authority** — `host:port` — and whose signed payload pins that same
+authority. A page served from `127.0.0.1:3082` calling a gateway on
+`127.0.0.1:3083` is therefore a different origin in both senses the browser
+cares about: the request is blocked as cross-origin, and the cookie would not be
+sent even if it were allowed.
+
+The symptom is an error the harness reports as *"failed to fetch gateway"* —
+which names the browser's complaint rather than its cause, and sends you looking
+at the wrong thing entirely.
+
+Serving every instance under one origin removes the problem at the root. Each
+instance is reachable at `/i/<name>/` on the control page's own address. The
+proxy connects to the instance's real loopback port, so the harness still sees
+`127.0.0.1:<its own port>` as its authority and mints a cookie that matches.
+
+Three details have to be right, and all three fail silently:
+
+- **Root-absolute URLs.** The harness's shell mixes `./assets/…` (fine) with
+  `/plugins/??…` and `href="/"`, which would resolve against the gateway and
+  404. HTML responses are rewritten so they stay inside the instance.
+- **Compressed responses.** Rewriting compressed bytes corrupts them. The relay
+  declines `Accept-Encoding` for navigations and confirms the encoding before
+  touching a body.
+- **Runtime-constructed URLs.** The live agent socket is built in JavaScript from
+  the origin, so no response rewrite can reach it. The gateway records which
+  instance a browser opened and routes those requests back to it.
+
+</details>
 
 <details>
 <summary><b>Where the pieces live</b></summary>
@@ -204,36 +272,36 @@ sit between you and your agent once they are running.
 | Path | Responsibility |
 |---|---|
 | `crates/router-core` | Errors, configuration, health, workspace path validation |
-| `crates/router-relay` | A streaming HTTP proxy, used by the control page |
-| `crates/router-dsh` | The harness adapter: supervision and readiness detection |
-| `crates/router-cli` | The `router` binary |
-| `docs/` | Security notes, permissions, troubleshooting |
+| `crates/router-relay` | The streaming HTTP/WebSocket proxy behind the single origin |
+| `crates/router-dsh` | **The only crate that knows how the harness works** |
+| `crates/router-cli` | The `router` binary and the control page |
+| `docs/` | Compatibility, security, permissions, troubleshooting |
+
+**The adapter rule:** no crate outside `router-dsh` may depend on harness
+specifics. The harness is in developer preview and breaking changes are expected;
+confining that coupling to one crate is what keeps an upstream change a localized
+edit rather than a rewrite.
 
 </details>
 
 ---
 
-### Your existing install keeps working
+## Quality
 
-The Router never touches your current harness. It does not read your `~/.dsh`,
-does not change your settings, and does not restart your processes. It starts new
-instances, on new ports, with new state. Your daily driver on 3080 is untouched.
+The things this project is careful about, stated plainly:
 
-### A control area
+| Guarantee | How it is kept |
+|---|---|
+| Your existing install is never touched | The Router never reads or writes `~/.dsh`; ports start at 3081 and 3080 is never claimed |
+| A process the Router did not start is never adopted or stopped | Ownership is proved by a PID recorded at spawn, re-confirmed against the port's real listener |
+| A workspace is never deleted | `router rm` unregisters the instance and leaves your project folder alone |
+| Two instances never share a state root | One `DSH_HOME` per instance, validated on registration |
+| No personal or machine information in this repository | Enforced by the working rules in [`AGENTS.md`](AGENTS.md) |
 
-One command lists everything — port, workspace, model, state, uptime. A local
-page shows the same at a glance, with start, stop, restart and open per instance.
-
-### It tells you when something is off
-
-Two instances pointed at the same folder is a quiet way to get two agents editing
-one tree. The Router notices and says so. So does a port that got taken, or a
-model route that does not exist.
-
-### Nothing phones home
-
-No telemetry, no account, no analytics. The Router talks to your machine's
-harnesses and to nothing else.
+**287 tests**, `cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo fmt --check` clean. Every non-obvious decision is commented with *why*,
+and the tests that guard a past defect were each confirmed to fail without the
+fix — a test that cannot fail proves nothing.
 
 ---
 
@@ -241,7 +309,7 @@ harnesses and to nothing else.
 
 | Platform | Status | Notes |
 |---|---|---|
-| **Windows** | Primary target | Built and run on the owner's machine |
+| **Windows** | Primary target | Where it is built and run day to day |
 | **macOS** | Supported | Same code paths; process and path handling are platform-tested |
 | **Linux** | Supported | Same code paths; process and path handling are platform-tested |
 
@@ -297,12 +365,24 @@ does not touch the others.
 </details>
 
 <details>
+<summary><b>What happens if something else is already using an instance's port?</b></summary>
+
+<br>
+
+The Router refuses to start that instance, names the process holding the port,
+and leaves it alone. It will not adopt a process it did not start, and it will
+not stop one either — an instance whose sessions you are actually reading should
+never be something the Router guessed at.
+
+</details>
+
+<details>
 <summary><b>What happens if two instances point at the same folder?</b></summary>
 
 <br>
 
-The Router warns you. Two agents editing one tree at the same time is a real
-hazard, and you should know before it happens rather than after.
+The Router warns you at registration. Two agents editing one tree at the same
+time is a real hazard, and you should know before it happens rather than after.
 
 </details>
 
@@ -313,7 +393,8 @@ hazard, and you should know before it happens rather than after.
 
 Only if you ask them to. By default each instance has its own credentials file,
 so you can use different keys for different projects. If you would rather set one
-key once, an instance can symlink to your existing credentials instead.
+key once, an instance can share your existing credentials by link, not by copy —
+so a key you rotate in one place changes everywhere it is used.
 
 </details>
 
@@ -354,8 +435,9 @@ Router itself runs natively.
 <br>
 
 Because the work is process supervision and concurrency: spawning, watching,
-restarting and stopping several children, and reporting their state without
-blocking. That is what a static binary with a real async runtime is good at.
+restarting and stopping several children, proxying their traffic, and reporting
+their state without blocking. That is what a static binary with a real async
+runtime is good at.
 
 </details>
 

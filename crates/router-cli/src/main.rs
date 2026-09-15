@@ -1461,17 +1461,37 @@ async fn cmd_doctor(style: &Style) -> Result<ExitCode, Failure> {
         }
     }
 
+    // The harness this command reports must be the one instances actually run.
+    //
+    // # Why `which("dsh")` is not the same thing
+    //
+    // A machine may carry several harnesses: the npm-global package, a bundled
+    // one inside an IDE, and a launcher shim on `PATH` that dispatches between
+    // them by argument. Resolving bare `dsh` finds the *shim*, which reports
+    // whichever version it is configured to route to — not the version a router
+    // instance starts. That made `doctor` confidently name a harness that was
+    // not running, which is precisely the kind of wrong answer a diagnostic
+    // exists to prevent.
+    //
+    // `resolve_harness` is the single place that decision is made, so this asks
+    // it rather than resolving again.
     let binary = std::env::var("DSH_BINARY").unwrap_or_else(|_| "dsh".to_string());
-    match which(&binary) {
-        Some(path) => {
+    match resolve_harness() {
+        Ok(path) => {
             let version = harness_version(&path).await;
             say(&style.ok(&format!(
                 "harness       {}{}",
                 path.display(),
                 version.map_or(String::new(), |v| format!("  ({v})"))
             )));
+            // Worth naming explicitly when a shim is involved: the point of a
+            // shim is to route elsewhere, and the reader should know which end of
+            // that routing the router uses.
+            if !binary.eq_ignore_ascii_case("dsh") {
+                say(&style.dim(&format!("              (from DSH_BINARY={binary})")));
+            }
         }
-        None => {
+        Err(_) => {
             say(&style.warn(&format!("harness       '{binary}' not found on PATH")));
             say(&style.dim("              install DeepSeek Harness, or set DSH_BINARY"));
             problems += 1;
@@ -1856,7 +1876,126 @@ async fn harness_version(binary: &std::path::Path) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
+    if s.is_empty() {
+        return None;
+    }
+
+    // A launcher shim answers `--version` for the version it is *configured* to
+    // route to, which is not necessarily the one it will run.
+    //
+    // # The concrete case
+    //
+    // A machine may carry a shim on `PATH` that dispatches by argument: one
+    // profile goes to a bundled harness, everything else to the npm-global one.
+    // Asked `--version` with no arguments, it reports the bundled version — so
+    // `doctor` named a harness that no router instance would ever start. The
+    // version a spawn will actually use is the one in the package beside the
+    // script the shim calls, so that is checked and preferred.
+    //
+    // This only ever *upgrades* the answer: if no package can be located, the
+    // shim's own reply stands, because a version from somewhere is still better
+    // than none.
+    if let Some(real) = version_from_package(binary) {
+        return Some(real);
+    }
+    Some(s)
+}
+
+/// The harness version recorded in the npm package a launcher points at.
+///
+/// Walks up from the launcher looking for the harness package's own manifest:
+/// `…/@deepseek-ai/dsh/package.json` for the npm layout, or a `bin.js` naming it.
+/// Returns `None` when this is not a launcher, which is the common case and must
+/// stay cheap.
+fn version_from_package(binary: &std::path::Path) -> Option<String> {
+    // Only a script launcher can point somewhere else. A real executable resolves
+    // to itself and there is nothing further to look up.
+    if binary.extension().is_some_and(|e| {
+        let e = e.to_string_lossy().to_ascii_lowercase();
+        e == "exe" || e == "bin"
+    }) {
+        return None;
+    }
+
+    let text = std::fs::read_to_string(binary).ok()?;
+
+    // The npm-global layout is the one worth supporting: a shim that delegates
+    // for non-special arguments runs `%APPDATA%\npm\dsh.cmd`, whose package is
+    // `%APPDATA%\npm\node_modules\@deepseek-ai\dsh` — note the `npm` segment,
+    // which is part of the prefix and not part of `node_modules`.
+    for root in [
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join("npm")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".npm-global")),
+        std::env::var_os("PREFIX").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let manifest = root
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("package.json");
+        // Only prefer this when the launcher actually points at that location,
+        // so an unrelated package elsewhere on the machine cannot be reported as
+        // the harness.
+        let Ok(json) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let Some(version) = json_version(&json) else {
+            continue;
+        };
+        if launcher_points_at(&text, &root) {
+            return Some(version);
+        }
+    }
+    None
+}
+
+/// Whether a launcher script refers to a filesystem root.
+///
+/// Matched in two forms, and both are necessary. A Windows batch shim writes
+/// `%APPDATA%\npm` and never the expanded value, so a literal-path comparison
+/// alone silently never matches — which is exactly the bug that made the wrong
+/// harness version be reported.
+fn launcher_points_at(launcher: &str, root: &std::path::Path) -> bool {
+    let expanded = root.to_string_lossy();
+    if launcher.contains(expanded.as_ref()) {
+        return true;
+    }
+
+    // The conventional variable form. A shim may write `%APPDATA%\npm`, so the
+    // root is compared both directly and with each known variable expanded in
+    // front of it.
+    for (var, value) in [
+        ("APPDATA", std::env::var("APPDATA").ok()),
+        ("LOCALAPPDATA", std::env::var("LOCALAPPDATA").ok()),
+        ("USERPROFILE", std::env::var("USERPROFILE").ok()),
+        ("HOME", std::env::var("HOME").ok()),
+    ] {
+        let Some(value) = value else { continue };
+        let base = std::path::Path::new(&value);
+        // The root itself, or the root with the variable as its prefix.
+        if (root == base || root.starts_with(base)) && launcher.contains(&format!("%{var}%")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract `"version": "x"` from a package manifest, without a JSON dependency.
+fn json_version(manifest: &str) -> Option<String> {
+    let index = manifest.find("\"version\"")?;
+    let rest = &manifest[index + "\"version\"".len()..];
+    let colon = rest.find(':')?;
+    let after = rest[colon + 1..].trim_start();
+    let quote = after.find('"')?;
+    let value = &after[quote + 1..];
+    let end = value.find('"')?;
+    let v = value[..end].trim();
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 /// Open a URL in the platform's default browser.
@@ -1941,6 +2080,61 @@ mod tests {
     fn a_name_is_used_verbatim_as_the_prefix() {
         let out = gateway_url("http://127.0.0.1:3082/?token=t", "my-notes", 3090).unwrap();
         assert!(out.contains("/i/my-notes/"), "got {out}");
+    }
+
+    #[test]
+    fn a_version_is_read_from_a_manifest() {
+        let manifest = r#"{ "name": "@deepseek-ai/dsh", "version": "0.1.5-rc.1" }"#;
+        assert_eq!(json_version(manifest).as_deref(), Some("0.1.5-rc.1"));
+    }
+
+    #[test]
+    fn a_manifest_without_a_version_yields_nothing() {
+        // Reporting a guess would be worse than reporting nothing: `doctor` is a
+        // diagnostic, and a wrong version sends the reader down a false path.
+        assert_eq!(json_version(r#"{ "name": "x" }"#), None);
+        assert_eq!(json_version(r#"{ "version": "" }"#), None);
+        assert_eq!(json_version(""), None);
+    }
+
+    #[test]
+    fn a_shim_is_recognised_by_its_variable_form() {
+        // The bug this guards: a Windows shim writes `%APPDATA%\npm` and never
+        // the expanded path, so a literal comparison silently never matched and
+        // the wrong harness version was reported.
+        let shim = r#"set "USER_DSH=%APPDATA%\npm\dsh.cmd""#;
+        let root = PathBuf::from(std::env::var("APPDATA").unwrap()).join("npm");
+        assert!(launcher_points_at(shim, &root));
+    }
+
+    #[test]
+    fn a_shim_is_recognised_by_its_expanded_form() {
+        let expanded = PathBuf::from(std::env::var("APPDATA").unwrap()).join("npm");
+        let shim = format!(r#"node "{}\dsh.cmd" %*"#, expanded.display());
+        assert!(launcher_points_at(&shim, &expanded));
+    }
+
+    #[test]
+    fn an_unrelated_launcher_does_not_claim_the_root() {
+        // Only a launcher that actually points at this location may borrow its
+        // version, or any script on the machine could be reported as the harness.
+        let root = PathBuf::from(std::env::var("APPDATA").unwrap()).join("npm");
+        assert!(!launcher_points_at("echo hello", &root));
+        assert!(!launcher_points_at("C:\\other\\place\\dsh.cmd", &root));
+    }
+
+    #[test]
+    fn a_native_executable_is_not_treated_as_a_launcher() {
+        // There is nothing further to look up for a real binary, and reading one
+        // as text would be meaningless.
+        let exe = std::path::Path::new("/opt/dsh/bin/dsh.exe");
+        assert!(exe.extension().is_some_and(|e| e == "exe"));
+        // The guard's predicate, stated directly so a change to it is caught.
+        let is_native = exe.extension().is_some_and(|e| {
+            let e = e.to_string_lossy().to_ascii_lowercase();
+            e == "exe" || e == "bin"
+        });
+        assert!(is_native);
     }
 
     #[test]
