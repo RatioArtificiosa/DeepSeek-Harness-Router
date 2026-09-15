@@ -19,7 +19,9 @@
 //!   error, so a script can tell a typo from a runtime problem.
 
 use clap::{Parser, Subcommand};
-use router_core::registry::{is_valid_instance_name, Instance, Registry, DEFAULT_BASE_PORT};
+use router_core::registry::{
+    is_valid_instance_name, Instance, Registry, RegistryLock, DEFAULT_BASE_PORT,
+};
 use router_core::term::{self, ColourMode, Ink, Style, Verbosity};
 use router_core::{allocate, validate_workspace, PortClaims, WorkspaceMode};
 use router_dsh::{InstanceSpec, MultiConfig, MultiSupervisor};
@@ -114,8 +116,14 @@ enum Command {
 
     /// Stop a running instance.
     Stop {
-        /// Which instance.
-        name: String,
+        /// Which instance. Omit it with --all to stop everything.
+        ///
+        /// Optional because `--all` is documented as stopping every instance,
+        /// and a required argument made that form impossible to run: clap
+        /// demanded a name, so the only accepted spelling was `stop <name>
+        /// --all`, which then ignored the name it required.
+        #[arg(required_unless_present = "all")]
+        name: Option<String>,
 
         /// Stop every running instance.
         #[arg(long)]
@@ -256,6 +264,55 @@ fn load(home_override: Option<PathBuf>) -> Result<(RouterHome, Registry), Failur
     Ok((home, registry))
 }
 
+/// How long to wait for the registry lock before giving up.
+///
+/// Generous, because the work it protects is a read, a small edit, and an
+/// atomic write — milliseconds. The timeout exists to bound a *stale* lock left
+/// by a killed process, not to accommodate slow work.
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Change the registry under an exclusive lock.
+///
+/// # Why every mutation goes through here
+///
+/// The registry is a whole-document read-modify-write, so two concurrent
+/// commands that each load, edit and save will lose one of the edits — the last
+/// rename wins and the other change disappears. Sixteen concurrent `add` calls
+/// lost six registrations this way while every one of them reported success.
+///
+/// The lock is taken *before* the load, and the document is re-read inside it.
+/// Reading first and locking second would not help: the edit would then be
+/// applied to a snapshot that another process had already replaced.
+///
+/// `edit` returns `Err` to abandon the change, which is how a caller rejects a
+/// duplicate name without writing anything.
+fn update_registry<T>(
+    home: &RouterHome,
+    edit: impl FnOnce(&mut Registry) -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    let path = home.registry_path();
+    let _lock = RegistryLock::acquire(&path, LOCK_TIMEOUT).map_err(|e| {
+        Failure::runtime(
+            e.detail.clone(),
+            "Another router command may be running. If not, delete the .lock file.",
+        )
+    })?;
+
+    // Re-read inside the lock: the document on disk now is the current one.
+    let mut registry = Registry::load(&path).map_err(|e| {
+        Failure::runtime(
+            e.detail.clone(),
+            "Fix or remove the registry file, then try again.",
+        )
+    })?;
+
+    let outcome = edit(&mut registry)?;
+    registry.save(&path).map_err(|e| {
+        Failure::runtime(e.detail.clone(), "Check that the router home is writable.")
+    })?;
+    Ok(outcome)
+}
+
 async fn run(cli: Cli, style: &Style) -> Result<ExitCode, Failure> {
     match cli.command {
         Command::Init { home } => cmd_init(style, home),
@@ -268,7 +325,7 @@ async fn run(cli: Cli, style: &Style) -> Result<ExitCode, Failure> {
         } => cmd_add(style, name, workspace, model, share_credentials, no_start).await,
         Command::List { probe } => cmd_list(style, probe),
         Command::Start { name } => cmd_start(style, &name).await,
-        Command::Stop { name, all } => cmd_stop(style, &name, all).await,
+        Command::Stop { name, all } => cmd_stop(style, name.as_deref(), all).await,
         Command::Restart { name } => cmd_restart(style, &name).await,
         Command::Open { name } => cmd_open(style, &name),
         Command::Logs { name } => cmd_logs(style, &name).await,
@@ -301,10 +358,50 @@ fn cmd_init(style: &Style, home_override: Option<PathBuf>) -> Result<ExitCode, F
         )
     })?;
 
-    let existed = home.registry_path().exists();
+    let registry_path = home.registry_path();
+    let existed = registry_path.exists();
+
+    // An existing registry is never overwritten.
+    //
+    // This was the most destructive bug in the tool. `init` unconditionally
+    // saved a fresh empty registry, so running it on a home whose registry had
+    // a typo — the natural next step after `list` reports one — replaced every
+    // instance with `instances: {}` and printed "already initialised", exit 0.
+    // The user lost every name, port and workspace with a success message.
+    //
+    // Two separate concerns, now separated: if the file parses, `init` has
+    // nothing to do; if it does not, that is a problem to report, not a state
+    // to reset. Deliberately no `--force`: wiping this file should require the
+    // user to move or delete it themselves, having seen what is in it.
+    if existed {
+        match Registry::load(&registry_path) {
+            Ok(existing) => {
+                if style.verbosity != Verbosity::Quiet {
+                    term::out(&style.info(&format!(
+                        "Router home already initialised at {}",
+                        style.strong(&home.root().display().to_string())
+                    )));
+                    term::out(&style.field("instances", &existing.instances.len().to_string()));
+                }
+                term::out(&home.root().display().to_string());
+                return Ok(ExitCode::SUCCESS);
+            }
+            Err(e) => {
+                // `Registry::load` already names the file in its message, so the
+                // path is not repeated here. Saying it twice reads as two
+                // different problems.
+                return Err(Failure::runtime(
+                    e.detail.clone(),
+                    "Fix or move that file, then run `router init` again. \
+                     It is left untouched so you can recover it.",
+                ));
+            }
+        }
+    }
+
     let registry = Registry::default();
     registry
-        .save(&home.registry_path())
+        .save(&registry_path)
         .map_err(|e| Failure::runtime(e.detail.clone(), "Check that the directory is writable."))?;
 
     if style.verbosity == Verbosity::Quiet {
@@ -312,16 +409,9 @@ fn cmd_init(style: &Style, home_override: Option<PathBuf>) -> Result<ExitCode, F
         return Ok(ExitCode::SUCCESS);
     }
 
-    if existed {
-        term::out(&style.info(&format!(
-            "Router home already initialised at {}",
-            style.strong(&home.root().display().to_string())
-        )));
-    } else {
-        term::out(&style.ok("Router home created"));
-    }
+    term::out(&style.ok("Router home created"));
     term::out(&style.field("home", &home.root().display().to_string()));
-    term::out(&style.field("registry", &home.registry_path().display().to_string()));
+    term::out(&style.field("registry", &registry_path.display().to_string()));
     term::out(&style.field("first port", &DEFAULT_BASE_PORT.to_string()));
     term::out("");
     term::out(&style.dim("  Add your first instance:"));
@@ -352,18 +442,10 @@ async fn cmd_add(
         ));
     }
 
-    let (home, mut registry) = load(None)?;
-
-    if registry.contains(&name) {
-        return Err(Failure::usage(
-            format!("an instance named '{name}' already exists"),
-            format!("Choose another name, or remove it first: router rm {name}"),
-        ));
-    }
-
     // The workspace must be a real directory: the harness refuses to register a
     // workspace over a path that does not exist, so discovering that here gives
-    // a better message than discovering it three layers down.
+    // a better message than discovering it three layers down. Done before the
+    // lock, because it touches no shared state and is the slowest step.
     let validated = validate_workspace(&workspace.to_string_lossy(), WorkspaceMode::Existing)
         .map_err(|e| {
             Failure::usage(
@@ -373,42 +455,68 @@ async fn cmd_add(
             )
         })?;
 
-    // Two instances on one directory means two agents editing one tree. The
-    // harness will not stop that, so the router does.
-    if let Some((other, _)) = registry.find_by_workspace(validated.host()) {
-        return Err(Failure::usage(
-            format!(
-                "instance '{other}' already uses {}",
-                validated.host().display()
-            ),
-            "Two agents editing one project conflict. Use a different directory, \
-             or remove the other instance first.",
-        ));
-    }
-
-    let claims = PortClaims::from_ports(registry.claimed_ports());
-    let outcome = allocate(None, registry.base_port, &claims).map_err(|e| {
+    let home = RouterHome::resolve(None).map_err(|e| {
         Failure::runtime(
             e.detail.clone(),
-            e.remediation().unwrap_or("Free a port and try again."),
+            "Set DSH_ROUTER_HOME to a writable directory.",
         )
     })?;
 
-    let mut instance = Instance::new(validated.host().to_path_buf(), outcome.port());
-    instance.model = model.clone();
-    instance.share_credentials = share_credentials;
+    // Everything that reads shared state happens inside the lock, and the
+    // registry is re-read there.
+    //
+    // This is not only about losing writes. The checks themselves are
+    // read-modify-write: the duplicate-name check, the duplicate-workspace
+    // check, and port allocation all read the registry and then act on it. Two
+    // concurrent adds could each see a name as free, each find a port free, and
+    // each save — producing a lost registration and, in the worst case, two
+    // instances on one port. Holding the lock across the whole decision is what
+    // makes the decision true at the moment it is made.
+    let (port, workspace_path) = update_registry(&home, |registry| {
+        if registry.contains(&name) {
+            return Err(Failure::usage(
+                format!("an instance named '{name}' already exists"),
+                format!("Choose another name, or remove it first: router rm {name}"),
+            ));
+        }
 
-    registry
-        .insert(&name, instance)
-        .map_err(|e| Failure::usage(e.detail.clone(), "Choose a different name."))?;
-    registry.save(&home.registry_path()).map_err(|e| {
-        Failure::runtime(e.detail.clone(), "Check that the router home is writable.")
+        // Two instances on one directory means two agents editing one tree. The
+        // harness will not stop that, so the router does.
+        if let Some((other, _)) = registry.find_by_workspace(validated.host()) {
+            return Err(Failure::usage(
+                format!(
+                    "instance '{other}' already uses {}",
+                    validated.host().display()
+                ),
+                "Two agents editing one project conflict. Use a different directory, \
+                 or remove the other instance first.",
+            ));
+        }
+
+        let claims = PortClaims::from_ports(registry.claimed_ports());
+        let outcome = allocate(None, registry.base_port, &claims).map_err(|e| {
+            Failure::runtime(
+                e.detail.clone(),
+                e.remediation().unwrap_or("Free a port and try again."),
+            )
+        })?;
+
+        let mut instance = Instance::new(validated.host().to_path_buf(), outcome.port());
+        instance.model = model.clone();
+        instance.share_credentials = share_credentials;
+
+        registry
+            .insert(&name, instance)
+            .map_err(|e| Failure::usage(e.detail.clone(), "Choose a different name."))?;
+
+        Ok((outcome.port(), validated.host().to_path_buf()))
     })?;
+    let _ = workspace_path;
 
     if style.verbosity != Verbosity::Quiet {
         term::out(&style.ok(&format!("Registered {}", style.strong(&name))));
         term::out(&style.field("workspace", &validated.host().display().to_string()));
-        term::out(&style.field("port", &outcome.port().to_string()));
+        term::out(&style.field("port", &port.to_string()));
         if let Some(m) = &model {
             term::out(&style.field("model", m));
         }
@@ -430,6 +538,10 @@ async fn cmd_add(
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Re-read rather than reusing a snapshot: the registry was mutated inside
+    // the lock, and starting from a stale document would look up a state root
+    // for an instance recorded with different values.
+    let (_home, registry) = load(None)?;
     start_one(style, &home, &registry, &name).await
 }
 
@@ -514,11 +626,22 @@ async fn start_one(
     }
 }
 
-async fn cmd_stop(style: &Style, name: &str, all: bool) -> Result<ExitCode, Failure> {
+async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCode, Failure> {
     // Only the registry is needed: stopping works from the port, so nothing here
     // depends on the router home or on a supervisor that this process does not
     // own.
     let (_, registry) = load(None)?;
+
+    // A name together with `--all` is contradictory. Previously the name was
+    // required and then silently ignored, so `stop alpha --all` stopped
+    // everything while naming one instance — the user could believe they had
+    // stopped only `alpha`. Refusing is the honest answer.
+    if all && name.is_some() {
+        return Err(Failure::usage(
+            "a name and --all cannot both be given".to_string(),
+            "Use `router stop <name>` for one instance, or `router stop --all` for every one.",
+        ));
+    }
 
     if all {
         let mut failures = Vec::new();
@@ -539,6 +662,8 @@ async fn cmd_stop(style: &Style, name: &str, all: bool) -> Result<ExitCode, Fail
         if failures.is_empty() {
             if style.verbosity != Verbosity::Quiet {
                 term::out(&style.ok(&format!("Stopped {stopped} instance(s)")));
+            } else {
+                term::out(&stopped.to_string());
             }
             return Ok(ExitCode::SUCCESS);
         }
@@ -547,6 +672,16 @@ async fn cmd_stop(style: &Style, name: &str, all: bool) -> Result<ExitCode, Fail
             "Check for orphaned processes with `router doctor`.",
         ));
     }
+
+    // `--all` is the only way to reach here without a name, and clap enforces
+    // that, so this is unreachable in practice; it exists so the function does
+    // not have to unwrap.
+    let Some(name) = name else {
+        return Err(Failure::usage(
+            "no instance named".to_string(),
+            "Give a name, or use --all to stop every instance.",
+        ));
+    };
 
     if !registry.contains(name) {
         return Err(unknown_instance(name, &registry));
@@ -617,15 +752,37 @@ async fn cmd_restart(style: &Style, name: &str) -> Result<ExitCode, Failure> {
 fn cmd_list(style: &Style, probe: bool) -> Result<ExitCode, Failure> {
     let (_home, registry) = load(None)?;
 
-    if registry.instances.is_empty() {
-        if style.verbosity != Verbosity::Quiet {
-            term::out(&style.dim("No instances yet."));
-            term::out("");
+    // `--quiet` emits one line per instance, tab-separated, with nothing else.
+    // A table is for a person reading a terminal; a script wants fields it can
+    // split without stripping colour and guessing at column widths.
+    if style.verbosity == Verbosity::Quiet {
+        for (name, instance) in &registry.instances {
+            let serving = if probe {
+                if probe_port(instance.port) {
+                    "up"
+                } else {
+                    "down"
+                }
+            } else {
+                "-"
+            };
             term::out(&format!(
-                "  Add one:  router add my-project --workspace {}",
-                style.paint(Ink::Blue, "~/projects/my-project")
+                "{name}\t{}\t{serving}\t{}\t{}",
+                instance.port,
+                instance.workspace.display(),
+                instance.model.as_deref().unwrap_or("default"),
             ));
         }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if registry.instances.is_empty() {
+        term::out(&style.dim("No instances yet."));
+        term::out("");
+        term::out(&format!(
+            "  Add one:  router add my-project --workspace {}",
+            style.paint(Ink::Blue, "~/projects/my-project")
+        ));
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -682,11 +839,9 @@ fn cmd_list(style: &Style, probe: bool) -> Result<ExitCode, Failure> {
 fn cmd_status(style: &Style) -> Result<ExitCode, Failure> {
     let (_home, registry) = load(None)?;
 
-    if registry.instances.is_empty() {
-        term::out(&style.dim("No instances registered."));
-        return Ok(ExitCode::SUCCESS);
-    }
-
+    // Count first, then print: the numbers are the answer and the prose is
+    // commentary, so `--quiet` emits the numbers alone. A script that gates on
+    // this command wants a value, not a sentence to parse.
     let mut up = 0usize;
     let mut down = 0usize;
     for instance in registry.instances.values() {
@@ -697,15 +852,21 @@ fn cmd_status(style: &Style) -> Result<ExitCode, Failure> {
         }
     }
 
-    term::out(&format!(
-        "{} up  {}  {} down",
-        style.paint(Ink::Green, &up.to_string()),
-        style.glyphs.sep,
-        style.paint(
-            if down > 0 { Ink::Amber } else { Ink::Dim },
-            &down.to_string()
-        )
-    ));
+    if style.verbosity == Verbosity::Quiet {
+        term::out(&format!("{up} up {down} down"));
+    } else if registry.instances.is_empty() {
+        term::out(&style.dim("No instances registered."));
+    } else {
+        term::out(&format!(
+            "{} up  {}  {} down",
+            style.paint(Ink::Green, &up.to_string()),
+            style.glyphs.sep,
+            style.paint(
+                if down > 0 { Ink::Amber } else { Ink::Dim },
+                &down.to_string()
+            )
+        ));
+    }
 
     // A non-zero exit when something is down, so a script can gate on it.
     if down > 0 {
@@ -778,7 +939,7 @@ async fn cmd_logs(style: &Style, name: &str) -> Result<ExitCode, Failure> {
 }
 
 async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failure> {
-    let (home, mut registry) = load(None)?;
+    let (home, registry) = load(None)?;
     let instance = registry
         .get(name)
         .cloned()
@@ -839,9 +1000,15 @@ async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failur
         }
     }
 
-    registry.remove(name);
-    registry.save(&home.registry_path()).map_err(|e| {
-        Failure::runtime(e.detail.clone(), "Check that the router home is writable.")
+    // The removal itself is a read-modify-write like any other, so it takes the
+    // lock. Without it, a concurrent `add` could be lost: `rm` would load the
+    // registry, delete its entry, and save a document written before the
+    // addition landed.
+    update_registry(&home, |registry| {
+        if registry.remove(name).is_none() {
+            return Err(unknown_instance(name, registry));
+        }
+        Ok(())
     })?;
 
     if style.verbosity != Verbosity::Quiet {
@@ -863,26 +1030,37 @@ async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failur
 // ─────────────────────────────────────────────────────────────────────────
 
 async fn cmd_doctor(style: &Style) -> Result<ExitCode, Failure> {
-    term::out(&style.heading("DeepSeek Harness Router — diagnostics"));
-    term::out("");
+    let quiet = style.verbosity == Verbosity::Quiet;
+
+    // `--quiet` prints the report and drops only the decoration. The first
+    // attempt at this suppressed every line, so `doctor --quiet` printed nothing
+    // and exited 0 — which reads as "all clear" and was the worst possible
+    // outcome for a diagnostic. The report itself is the useful part; the
+    // heading and the closing banner are not.
+    let say = |line: &str| term::out(line);
+
+    if !quiet {
+        term::out(&style.heading("DeepSeek Harness Router — diagnostics"));
+        term::out("");
+    }
 
     let mut problems = 0usize;
 
     match RouterHome::resolve(None) {
         Ok(home) => {
             if home.registry_path().exists() {
-                term::out(&style.ok(&format!("home          {}", home.root().display())));
+                say(&style.ok(&format!("home          {}", home.root().display())));
             } else {
-                term::out(&style.warn(&format!(
+                say(&style.warn(&format!(
                     "home          {} (not initialised)",
                     home.root().display()
                 )));
-                term::out(&style.dim("              run `router init`"));
+                say(&style.dim("              run `router init`"));
                 problems += 1;
             }
         }
         Err(e) => {
-            term::out(&style.warn(&format!("home          unavailable: {}", e.detail)));
+            say(&style.warn(&format!("home          unavailable: {}", e.detail)));
             problems += 1;
         }
     }
@@ -891,31 +1069,31 @@ async fn cmd_doctor(style: &Style) -> Result<ExitCode, Failure> {
     match which(&binary) {
         Some(path) => {
             let version = harness_version(&path).await;
-            term::out(&style.ok(&format!(
+            say(&style.ok(&format!(
                 "harness       {}{}",
                 path.display(),
                 version.map_or(String::new(), |v| format!("  ({v})"))
             )));
         }
         None => {
-            term::out(&style.warn(&format!("harness       '{binary}' not found on PATH")));
-            term::out(&style.dim("              install DeepSeek Harness, or set DSH_BINARY"));
+            say(&style.warn(&format!("harness       '{binary}' not found on PATH")));
+            say(&style.dim("              install DeepSeek Harness, or set DSH_BINARY"));
             problems += 1;
         }
     }
 
     if probe_port(3080) {
-        term::out(&style.info("port 3080     in use (expected — the router starts at 3081)"));
+        say(&style.info("port 3080     in use (expected — the router starts at 3081)"));
     } else {
-        term::out(&style.info("port 3080     free"));
+        say(&style.info("port 3080     free"));
     }
 
     let (_home, registry) = load(None)?;
     if registry.instances.is_empty() {
-        term::out(&style.info("instances     none registered"));
+        say(&style.info("instances     none registered"));
     } else {
-        term::out("");
-        term::out(&style.strong("  Instances"));
+        say("");
+        say(&style.strong("  Instances"));
         for (name, instance) in &registry.instances {
             let live = probe_port(instance.port);
             let workspace_ok = instance.workspace.is_dir();
@@ -930,7 +1108,7 @@ async fn cmd_doctor(style: &Style) -> Result<ExitCode, Failure> {
             } else {
                 style.paint(Ink::Amber, &format!("{state} — workspace missing"))
             };
-            term::out(&format!(
+            say(&format!(
                 "    {marker} {}  :{}  {state_text}",
                 term::pad(name, 16),
                 instance.port
@@ -941,12 +1119,12 @@ async fn cmd_doctor(style: &Style) -> Result<ExitCode, Failure> {
         }
     }
 
-    term::out("");
+    say("");
     if problems == 0 {
-        term::out(&style.ok("Everything checks out"));
+        say(&style.ok("Everything checks out"));
         Ok(ExitCode::SUCCESS)
     } else {
-        term::out(&style.warn(&format!("{problems} thing(s) need attention")));
+        say(&style.warn(&format!("{problems} thing(s) need attention")));
         Ok(ExitCode::from(FAIL_EXIT))
     }
 }

@@ -219,6 +219,117 @@ pub fn is_valid_instance_name(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// An exclusive lock over the read-modify-write of a registry.
+///
+/// # The bug this exists to prevent
+///
+/// `add` reads the registry, inserts one entry, and writes the whole document
+/// back. Each individual write is atomic — unique temp file, fsync, rename — but
+/// nothing serialises the *sequence*. Sixteen concurrent `add` calls therefore
+/// produced sixteen reads of the same starting document and sixteen writes, each
+/// containing only its own addition. The last rename won, and six of the sixteen
+/// registrations vanished — every one of them after printing "OK Registered" and
+/// exiting 0.
+///
+/// That is the same "last-completion wins" corruption the harness documentation
+/// describes and this project exists to avoid. Having it in our own registry is
+/// worse than having it in the harness, because we control this one.
+///
+/// # Why a lock file rather than an OS file lock
+///
+/// A lock file created with `create_new` is atomic on every platform this tool
+/// targets, needs no dependency, and — unlike an advisory byte-range lock — is
+/// visible: a stale lock left by a killed process is a file the user can inspect
+/// and delete. The cost is that staleness must be handled, which [`Lock::acquire`]
+/// does by timing out with a message naming the file.
+///
+/// This locks the router's own state. It does not, and must not, take anything
+/// belonging to a running harness.
+pub struct RegistryLock {
+    path: PathBuf,
+}
+
+impl RegistryLock {
+    /// Acquire the lock covering a registry, waiting up to `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::IoFailed`] if the lock cannot be taken within the
+    /// timeout, naming the lock file so a stale one can be removed by hand.
+    pub fn acquire(registry_path: &Path, timeout: std::time::Duration) -> Result<Self> {
+        let path = lock_path(registry_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                RouterError::new(
+                    ErrorCode::IoFailed,
+                    format!("cannot create {}: {e}", parent.display()),
+                )
+            })?;
+        }
+
+        let deadline = std::time::Instant::now() + timeout;
+        let mut delay = std::time::Duration::from_millis(2);
+        loop {
+            // `create_new` is the atomic test-and-set: it fails if the file
+            // exists, with no window between checking and creating.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    // The pid makes a stale lock diagnosable rather than merely
+                    // an obstacle.
+                    let _ = write!(file, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(RouterError::new(
+                            ErrorCode::IoFailed,
+                            format!(
+                                "timed out waiting for the registry lock at {}. \
+                                 Another router command may be running; if not, \
+                                 delete that file.",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    // Backs off so a burst of writers does not spin, and so the
+                    // winner has time to finish.
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(RouterError::new(
+                        ErrorCode::IoFailed,
+                        format!("cannot create the lock at {}: {e}", path.display()),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        // Best effort: a lock left behind by a failed removal is recovered by
+        // the timeout above, and panicking during unwinding would be worse.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Where a registry's lock file lives.
+fn lock_path(registry_path: &Path) -> PathBuf {
+    let mut name = registry_path.file_name().map_or_else(
+        || std::ffi::OsString::from("router.yaml"),
+        ToOwned::to_owned,
+    );
+    name.push(".lock");
+    registry_path.with_file_name(name)
+}
+
 impl Registry {
     /// The router home that a registry path implies.
     ///
@@ -803,6 +914,61 @@ mod tests {
         assert_eq!(
             Registry::home_for(p),
             PathBuf::from("/home/user/.deepseek-router")
+        );
+    }
+
+    #[test]
+    fn the_lock_excludes_a_second_holder() {
+        // The whole point: two writers must not hold it at once. Without this,
+        // a read-modify-write sequence in two processes loses one edit — which
+        // is exactly what happened, silently, while both reported success.
+        let (_d, path) = tmp_registry();
+        let first = RegistryLock::acquire(&path, std::time::Duration::from_secs(1)).unwrap();
+
+        let Err(err) = RegistryLock::acquire(&path, std::time::Duration::from_millis(150)) else {
+            panic!("a second holder must not be able to take the lock");
+        };
+        assert_eq!(err.code, ErrorCode::IoFailed);
+        assert!(
+            err.detail.contains(".lock"),
+            "the error must name the lock file so a stale one can be removed: {}",
+            err.detail
+        );
+
+        drop(first);
+    }
+
+    #[test]
+    fn the_lock_is_released_on_drop() {
+        // A lock that outlives its holder would block every later command until
+        // someone deleted a file they do not know about.
+        let (_d, path) = tmp_registry();
+        {
+            let _held = RegistryLock::acquire(&path, std::time::Duration::from_secs(1)).unwrap();
+        }
+        let again = RegistryLock::acquire(&path, std::time::Duration::from_secs(1));
+        assert!(again.is_ok(), "the lock must be reacquirable after release");
+    }
+
+    #[test]
+    fn a_lock_records_the_holding_process() {
+        // Diagnosability: a stale lock is a file the user may need to remove,
+        // and knowing which process left it is the difference between a guess
+        // and an answer.
+        let (_d, path) = tmp_registry();
+        let _held = RegistryLock::acquire(&path, std::time::Duration::from_secs(1)).unwrap();
+        let contents = std::fs::read_to_string(lock_path(&path)).unwrap();
+        assert_eq!(contents.trim(), std::process::id().to_string());
+    }
+
+    #[test]
+    fn the_lock_sits_beside_the_registry() {
+        // Same directory, so it is covered by the same permissions and travels
+        // with the home rather than appearing somewhere unexpected.
+        let p = PathBuf::from("/router-home/router.yaml");
+        assert_eq!(
+            lock_path(&p),
+            PathBuf::from("/router-home/router.yaml.lock")
         );
     }
 }

@@ -12,7 +12,7 @@ without them interfering with each other.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-4f8cff.svg?style=flat-square)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/core-Rust-f74c00.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Harness](https://img.shields.io/badge/harness-0.1.5--rc.1-37e0c8.svg?style=flat-square)](docs/dsh-compatibility.md)
+[![Harness](https://img.shields.io/badge/harness-0.1.x-37e0c8.svg?style=flat-square)](docs/dsh-compatibility.md)
 [![Status: in development](https://img.shields.io/badge/status-in%20development-ffce6a.svg?style=flat-square)](#-project-status)
 
 <br>

@@ -357,22 +357,23 @@ impl MultiSupervisor {
     }
 
     /// The command line for one instance.
+    ///
+    /// Delegates to [`SupervisorConfig::command_argv`] rather than assembling
+    /// its own. There were previously two builders, which is a divergence
+    /// hazard: a flag corrected in one path and not the other produces two
+    /// different harness invocations from the same product, and the difference
+    /// only shows up in whichever path is less used.
     #[must_use]
     pub fn command_argv(&self, spec: &InstanceSpec) -> Vec<String> {
-        let mut argv = vec![
-            self.config.binary.to_string_lossy().to_string(),
-            "web".to_string(),
-            "--host".to_string(),
-            "127.0.0.1".to_string(),
-            "--port".to_string(),
-            spec.port.to_string(),
-            "--no-open".to_string(),
-        ];
-        for host in &self.config.trusted_hosts {
-            argv.push("--trusted-host".to_string());
-            argv.push(host.clone());
+        crate::supervisor::SupervisorConfig {
+            binary: self.config.binary.clone(),
+            internal_port: spec.port,
+            workspace: spec.workspace.clone(),
+            dsh_home: spec.state_root.clone(),
+            ready_timeout: self.config.ready_timeout,
+            trusted_hosts: self.config.trusted_hosts.clone(),
         }
-        argv
+        .command_argv()
     }
 
     async fn await_ready(

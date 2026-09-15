@@ -51,10 +51,21 @@ impl SupervisorConfig {
     /// Exposed so tests and the doctor command can assert the exact arguments
     /// rather than guessing, and so no caller builds an argv by string
     /// concatenation, so a hostile argument cannot become an extra flag.
+    ///
+    /// # Why `--profile web` and not the `web` alias
+    ///
+    /// The harness accepts `dsh web …` as a convenience alias, and it works.
+    /// But the harness's own help documents the interface as
+    /// `dsh --profile web [options]`, and lists only that form under Examples.
+    /// An alias is a convenience that can be withdrawn or re-pointed; the
+    /// documented profile selector is the contract. This project pins to
+    /// documented interfaces so an upstream release is a tested upgrade rather
+    /// than a surprise, so the documented form is what we emit.
     #[must_use]
     pub fn command_argv(&self) -> Vec<String> {
         let mut argv = vec![
             self.binary.to_string_lossy().to_string(),
+            "--profile".to_string(),
             "web".to_string(),
             "--host".to_string(),
             "127.0.0.1".to_string(),
@@ -512,7 +523,11 @@ mod tests {
     fn argv_binds_loopback_and_never_opens_a_browser() {
         let argv = cfg().command_argv();
         assert_eq!(argv[0], "/opt/dsh/bin/dsh");
-        assert_eq!(argv[1], "web");
+        assert_eq!(
+            argv[1], "--profile",
+            "the documented profile form, not the alias"
+        );
+        assert_eq!(argv[2], "web");
 
         let joined = argv.join(" ");
         // The harness's own safety refusal is honoured, not worked around.
