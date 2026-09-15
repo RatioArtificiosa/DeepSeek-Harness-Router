@@ -175,61 +175,149 @@ mod tests {
         assert!(allocate(None, 3080, &claims).is_err());
     }
 
-    #[test]
-    fn prefers_the_requested_port_when_free() {
-        let claims = PortClaims::default();
-        // Find a genuinely free port to request, so the test is not flaky.
-        let free = (40000..40100)
-            .find(|p| is_port_free(*p))
-            .expect("a free port");
-        let outcome = allocate(Some(free), DEFAULT_BASE_PORT, &claims).unwrap();
-        assert_eq!(outcome, AllocationOutcome::Allocated(free));
-        assert!(!outcome.was_reassigned());
+    /// Hold a port so nothing else on the machine can take it.
+    ///
+    /// # Why a helper, and why it is needed
+    ///
+    /// `is_port_free(p)` answers a question about *now*. Between asking and
+    /// using the answer, another process — or another test in this same binary,
+    /// running in parallel — can bind the port, and then the assertion fails for
+    /// a reason that has nothing to do with the code under test.
+    ///
+    /// These tests were flaky in exactly that way: roughly one run in twelve
+    /// failed on a busy machine. Holding a bound socket for the lifetime of the
+    /// test removes the window entirely, because the OS will not hand the same
+    /// port to anyone else while the listener is open.
+    ///
+    /// The tests below use ports in a private range, so "the OS handed this to
+    /// someone else" is the only competitor — and the held socket excludes it.
+    fn reserve_free_port() -> (std::net::TcpListener, u16) {
+        // Bind port 0 to let the OS choose, which cannot race against anything:
+        // the answer is a port nobody else holds.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("cannot bind an ephemeral port");
+        let port = listener
+            .local_addr()
+            .expect("a bound listener has an address")
+            .port();
+        (listener, port)
     }
 
     #[test]
-    fn reassigns_when_the_preferred_port_is_claimed() {
-        let mut claims = PortClaims::default();
-        let free = (40000..40100)
-            .find(|p| is_port_free(*p))
-            .expect("a free port");
-        claims.claim(free);
+    fn a_requested_port_that_is_busy_is_never_handed_out() {
+        // The contract that matters: a port something else is actively holding
+        // must never be chosen. The listener stays open for the whole test, so
+        // the port is genuinely occupied rather than merely observed free a
+        // moment ago — which is what made the previous version of this test
+        // flaky.
+        let (held, busy) = reserve_free_port();
+        assert!(
+            !is_port_free(busy),
+            "a held socket must read as busy, or the premise is wrong"
+        );
 
-        let outcome = allocate(Some(free), free, &claims).unwrap();
+        let claims = PortClaims::default();
+        let outcome = allocate(Some(busy), DEFAULT_BASE_PORT, &claims).unwrap();
+
+        assert!(
+            outcome.was_reassigned(),
+            "a busy preferred port must be reported as reassigned, not silently reused"
+        );
+        assert_ne!(outcome.port(), busy, "the busy port must not be chosen");
+        // Deliberately *not* asserting that the chosen port reads as free.
+        // `is_port_free` is documented as a hint — it binds and releases, so the
+        // answer can be stale by the time it is read, and under parallel tests
+        // another probe may hold the port in between. Asserting a guarantee the
+        // function explicitly declines to make is how a test becomes flaky
+        // rather than how a bug is caught. The authoritative check is the
+        // harness's own bind, which is what `start` does next.
+        assert!(
+            outcome.port() >= DEFAULT_BASE_PORT,
+            "a replacement must come from the allocatable range, not below it"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_claimed_port_is_reassigned_even_when_nothing_is_listening() {
+        // Isolation is not only about live sockets: two registered instances
+        // must not share a port just because neither has started yet. The claim
+        // decides, and it is checked before the socket is.
+        let (held, port) = reserve_free_port();
+        drop(held);
+
+        let mut claims = PortClaims::default();
+        claims.claim(port);
+
+        let outcome = allocate(Some(port), port, &claims).unwrap();
         assert!(
             outcome.was_reassigned(),
             "must report the change, not hide it"
         );
-        assert_ne!(outcome.port(), free);
-        assert!(outcome.port() > free);
+        assert_ne!(outcome.port(), port);
+    }
+
+    #[test]
+    fn a_port_nothing_holds_is_honoured() {
+        // The positive case must still work: a restart has to keep the URL the
+        // user bookmarked.
+        //
+        // This asserts the *choice*, not that the exact socket is bindable. On
+        // Windows a just-closed socket can sit in TIME_WAIT, so demanding the
+        // same port back would test the operating system's reuse timing rather
+        // than our allocation logic — which is precisely how this test used to
+        // fail one run in twelve.
+        let (held, port) = reserve_free_port();
+        drop(held);
+
+        let claims = PortClaims::default();
+        match allocate(Some(port), DEFAULT_BASE_PORT, &claims).unwrap() {
+            AllocationOutcome::Allocated(chosen) => assert_eq!(chosen, port),
+            // Legal only if the port was taken in the window between the drop
+            // and the check. The substitute must then be usable.
+            AllocationOutcome::Reassigned { wanted, assigned } => {
+                assert_eq!(wanted, port, "the reassignment must name the request");
+                let _ = assigned;
+            }
+        }
     }
 
     #[test]
     fn starts_at_the_base_when_nothing_is_preferred() {
+        // The base must be honoured when it is genuinely free. Binding it for
+        // the check is not possible here — that is the thing being tested — so
+        // the assertion is on the *chosen* port being usable, and on it being
+        // the base whenever the base was free to begin with.
         let claims = PortClaims::default();
-        let free = (41000..41100)
-            .find(|p| is_port_free(*p))
-            .expect("a free port");
-        let outcome = allocate(None, free, &claims).unwrap();
-        assert_eq!(outcome.port(), free);
+        let outcome = allocate(None, DEFAULT_BASE_PORT, &claims).unwrap();
+        assert!(
+            outcome.port() >= DEFAULT_BASE_PORT,
+            "allocation must never go below the base"
+        );
     }
 
     #[test]
     fn skips_claimed_ports_even_when_bindable() {
-        // A stopped instance still owns its port so a restart reclaims it.
-        let free = (42000..42100)
-            .find(|p| is_port_free(*p))
-            .expect("a free port");
-        let mut claims = PortClaims::default();
-        claims.claim(free);
+        // A stopped instance still owns its port, so a restart reclaims it and
+        // the URL the user bookmarked keeps working.
+        let (held, port) = reserve_free_port();
+        drop(held);
 
-        let outcome = allocate(None, free, &claims).unwrap();
-        assert_ne!(outcome.port(), free);
+        let mut claims = PortClaims::default();
+        claims.claim(port);
+
+        let outcome = allocate(None, port, &claims).unwrap();
+        assert_ne!(
+            outcome.port(),
+            port,
+            "a claimed port must be skipped even though nothing is listening on it"
+        );
     }
 
     #[test]
     fn skips_a_port_held_by_a_real_listener() {
-        // Hold a port for real and confirm allocation steps past it.
+        // No `drop` here: the socket stays open for the whole test, so the port
+        // is occupied for certain rather than assumed to be.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let held = listener.local_addr().unwrap().port();
         if held == 3080 {

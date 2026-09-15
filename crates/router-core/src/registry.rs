@@ -118,6 +118,29 @@ const fn default_base_port() -> u16 {
     DEFAULT_BASE_PORT
 }
 
+/// A sibling path no other writer will choose.
+///
+/// Uniqueness comes from the process id plus a monotonic counter rather than
+/// from a clock: two threads in one process must not collide either, and a
+/// clock is not guaranteed to advance between two calls made microseconds
+/// apart.
+///
+/// The name keeps the `.yaml.tmp` suffix so a leftover file after a hard kill
+/// is recognisable as ours rather than as a registry the tool should try to
+/// read.
+fn unique_temp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("router.yaml"),
+        ToOwned::to_owned,
+    );
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
 impl Default for Registry {
     fn default() -> Self {
         Self {
@@ -126,6 +149,38 @@ impl Default for Registry {
             instances: BTreeMap::new(),
         }
     }
+}
+
+/// Device names Windows reserves in every directory.
+///
+/// These are not ordinary names. `CreateDirectoryW` given `CON` does not create
+/// a directory: it opens the console device. The router would register the
+/// instance, print a state-root path that can never exist, and then fail to
+/// start with a bare `os error 267` ("The directory name is invalid").
+///
+/// A name is reserved even with an extension or trailing spaces, so `CON`, `con`,
+/// `CON.txt` and `CON ` are all the same device. The check is therefore on the
+/// stem, case-insensitively.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Whether a name collides with a reserved device name.
+///
+/// Split out because the rule is subtle enough to deserve its own test, and
+/// because the reasoning applies wherever an instance name becomes a path.
+#[must_use]
+fn is_reserved_device_name(name: &str) -> bool {
+    // `CON.txt` and `CON ` still open the device, so only the stem before the
+    // first dot matters, and surrounding whitespace is ignored.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end()
+        .to_ascii_uppercase();
+    WINDOWS_RESERVED_NAMES.contains(&stem.as_str())
 }
 
 /// Whether a name is safe to use as an instance identifier.
@@ -141,9 +196,23 @@ pub fn is_valid_instance_name(name: &str) -> bool {
     if name.chars().all(|c| c == '.') {
         return false;
     }
+    // A reserved device name is rejected on every platform, not only Windows.
+    // The registry is a portable file, and a name that works on Linux and
+    // breaks on Windows is a name that breaks on the machine the user is
+    // actually running — after they have already adopted it.
+    if is_reserved_device_name(name) {
+        return false;
+    }
     let mut chars = name.chars();
     let first = chars.next().unwrap_or(' ');
     if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    // No trailing dot: Windows silently strips it, so `alpha.` and `alpha`
+    // would be the same directory while being two different registry keys —
+    // two instances sharing one state root, which is the one thing this
+    // project must never create.
+    if name.ends_with('.') {
         return false;
     }
     name.chars()
@@ -233,7 +302,20 @@ impl Registry {
         })?;
 
         // A sibling temp file guarantees the rename stays on one filesystem.
-        let temp = path.with_extension("yaml.tmp");
+        //
+        // The name is unique per write, not fixed. A single shared
+        // `router.yaml.tmp` would be a real hazard: two `router add` commands
+        // running at once would open the same temporary file, interleave their
+        // writes, and the second rename would publish a document assembled from
+        // both. That is precisely the "last-completion wins" corruption this
+        // project exists to prevent — and it would be in the router's own
+        // registry.
+        //
+        // A unique name per write means concurrent writers never share a file,
+        // so the final rename is always atomic and always publishes one writer's
+        // complete document. The last writer wins, but it wins *cleanly*: every
+        // intermediate document is internally consistent.
+        let temp = unique_temp_path(path);
         {
             use std::io::Write as _;
             let mut file = std::fs::File::create(&temp).map_err(|e| {
@@ -417,6 +499,20 @@ impl Registry {
 mod tests {
     use super::*;
 
+    /// Whether a filename is one of our temporary registry files.
+    ///
+    /// Case-insensitive because the check must hold on a filesystem that does
+    /// not preserve case, where `.TMP` and `.tmp` are the same file.
+    fn is_our_temp_file(name: &str) -> bool {
+        let is_tmp = std::path::Path::new(name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("tmp"));
+        let named_for_the_registry = name
+            .get(.."router.yaml.".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("router.yaml."));
+        is_tmp && named_for_the_registry
+    }
+
     fn tmp_registry() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("router.yaml");
@@ -462,8 +558,43 @@ mod tests {
 
         assert!(path.exists());
         assert!(
-            !path.with_extension("yaml.tmp").exists(),
-            "the temporary file must not survive a successful save"
+            !leaves_a_temp_file(&path),
+            "no temporary file may survive a successful save"
+        );
+    }
+
+    /// Whether any leftover temp file exists beside the registry.
+    ///
+    /// The temp name is unique per write, so a test cannot predict it; it looks
+    /// for the pattern instead.
+    fn leaves_a_temp_file(path: &Path) -> bool {
+        let dir = path.parent().expect("the registry has a parent");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            is_our_temp_file(&name)
+        })
+    }
+
+    #[test]
+    fn concurrent_saves_use_distinct_temp_files() {
+        // A single shared temp name would let two writers interleave into one
+        // file, and whichever renamed second would publish a document assembled
+        // from both. The names must therefore differ per write.
+        let path = PathBuf::from("/router-home/router.yaml");
+        let a = unique_temp_path(&path);
+        let b = unique_temp_path(&path);
+        assert_ne!(a, b, "each write needs its own temporary file");
+
+        // Still a sibling, so the rename stays on one filesystem and is atomic.
+        assert_eq!(a.parent(), path.parent());
+        assert_eq!(b.parent(), path.parent());
+        let name = a.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            is_our_temp_file(&name),
+            "the temp file must be recognisable as ours, got {name}"
         );
     }
 
@@ -580,6 +711,52 @@ mod tests {
         ] {
             assert!(!is_valid_instance_name(bad), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn reserved_device_names_are_rejected() {
+        // These do not create directories on Windows: `CreateDirectoryW("CON")`
+        // opens the console device. Registering one produced an instance that
+        // reported success, printed a state root that could never exist, and
+        // failed to start with a bare `os error 267`.
+        for bad in [
+            "CON", "con", "Con", "PRN", "AUX", "NUL", "nul", "COM1", "com9", "LPT1", "lpt9",
+        ] {
+            assert!(
+                !is_valid_instance_name(bad),
+                "{bad:?} is a reserved device name and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_names_are_rejected_with_extensions_and_spacing() {
+        // Windows resolves the device from the stem, so these are all the same
+        // device and all equally unusable.
+        for bad in ["CON.txt", "con.log", "NUL.json", "COM1.yaml", "PRN "] {
+            assert!(
+                !is_valid_instance_name(bad),
+                "{bad:?} still resolves to a reserved device and must be rejected"
+            );
+        }
+        // Names that merely *contain* a reserved word are ordinary.
+        for good in ["console", "connor", "nullable", "com10", "lpt10", "my-nul"] {
+            assert!(
+                is_valid_instance_name(good),
+                "{good:?} is not a reserved device and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_is_rejected() {
+        // Windows strips a trailing dot, so `alpha.` and `alpha` are the same
+        // directory while being two different registry keys. Two instances
+        // sharing one state root is the single thing this project must never
+        // create, so the ambiguity is refused rather than resolved.
+        assert!(!is_valid_instance_name("alpha."));
+        assert!(!is_valid_instance_name("a.."));
+        assert!(is_valid_instance_name("a.b"), "an interior dot is fine");
     }
 
     #[test]

@@ -1123,9 +1123,8 @@ mod tests {
     /// Render a fitted table as though the terminal were `width` columns wide.
     ///
     /// The width is set through `COLUMNS` rather than a parameter because that
-    /// is the mechanism the renderer itself uses, so the test exercises the real
-    /// detection path instead of a seam that only exists for testing. Tests that
-    /// touch process-wide environment are serialised by the caller.
+    /// is the mechanism the renderer itself uses, so the tests exercise the real
+    /// detection path instead of a seam that exists only for testing.
     fn fitted_at(
         width: usize,
         style: &Style,
@@ -1136,10 +1135,29 @@ mod tests {
         with_columns(Some(width), || table_fitted(style, headers, rows, flex))
     }
 
+    /// Serialises every test that touches `COLUMNS`.
+    ///
+    /// Environment is process-wide, so the test runner's parallelism turns
+    /// `set_var` into a race: one test sets a narrow width, another asserts
+    /// against a wide one, and whichever loses fails intermittently. That is
+    /// exactly what happened — the fitting tests passed alone and failed in a
+    /// full run.
+    ///
+    /// A poisoned mutex is recovered rather than propagated: a test that
+    /// panicked while holding this lock has already reported its own failure,
+    /// and making every later test fail too would bury the real cause.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Run `body` with `COLUMNS` set to `width` (or unset when `None`).
     ///
-    /// Restored afterwards so one test's width cannot leak into the next.
+    /// Holds [`env_lock`] for the duration, so the width one test sets cannot
+    /// be observed by another, and restores the previous value afterwards.
     fn with_columns<T>(width: Option<usize>, body: impl FnOnce() -> T) -> T {
+        let _guard = env_lock();
         let previous = std::env::var_os("COLUMNS");
         match width {
             Some(w) => unsafe { std::env::set_var("COLUMNS", w.to_string()) },
@@ -1151,6 +1169,22 @@ mod tests {
             None => unsafe { std::env::remove_var("COLUMNS") },
         }
         out
+    }
+
+    /// Tests that read or write `NO_COLOR` need the same protection.
+    #[test]
+    fn colour_mode_reads_the_environment_without_racing() {
+        let _guard = env_lock();
+        let previous = std::env::var_os("NO_COLOR");
+        unsafe { std::env::set_var("NO_COLOR", "1") };
+        assert!(
+            !ColourMode::Auto.enabled(true),
+            "NO_COLOR must disable auto"
+        );
+        match previous {
+            Some(v) => unsafe { std::env::set_var("NO_COLOR", v) },
+            None => unsafe { std::env::remove_var("NO_COLOR") },
+        }
     }
 
     /// A table that fits: the wide column does the giving.
