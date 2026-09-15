@@ -272,7 +272,7 @@ async fn run(cli: Cli, style: &Style) -> Result<ExitCode, Failure> {
         Command::Restart { name } => cmd_restart(style, &name).await,
         Command::Open { name } => cmd_open(style, &name),
         Command::Logs { name } => cmd_logs(style, &name).await,
-        Command::Rm { name, yes } => cmd_rm(style, &name, yes),
+        Command::Rm { name, yes } => cmd_rm(style, &name, yes).await,
         Command::Status => cmd_status(style),
         Command::Doctor => cmd_doctor(style).await,
         Command::Serve { port, no_open } => control::serve(style, port, no_open).await,
@@ -777,18 +777,32 @@ async fn cmd_logs(style: &Style, name: &str) -> Result<ExitCode, Failure> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failure> {
+async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failure> {
     let (home, mut registry) = load(None)?;
     let instance = registry
         .get(name)
         .cloned()
         .ok_or_else(|| unknown_instance(name, &registry))?;
 
+    // An instance that is serving must be stopped before it is forgotten.
+    //
+    // Removing the registry entry alone left the harness running with nothing
+    // pointing at it: an agent still holding the port, still holding its
+    // credentials, and unreachable through `router` — no name to stop, no name
+    // to show in `list`. The user believed it was gone.
+    let serving = probe_port(instance.port);
+
     if !yes {
         // Say plainly what will and will not happen. The reassurance is the
         // important half: people hesitate before a destructive-looking command,
         // and rightly so.
         term::out(&format!("  Remove instance {}?", style.strong(name)));
+        if serving {
+            term::out(&style.warn(&format!(
+                "    It is SERVING on port {} and will be stopped first.",
+                instance.port
+            )));
+        }
         term::out(&style.dim(&format!(
             "    Its workspace {} is NOT touched.",
             instance.workspace.display()
@@ -799,7 +813,30 @@ fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failure> {
         )));
         term::out("");
         term::out(&style.dim("  Re-run with --yes to confirm."));
-        return Ok(ExitCode::SUCCESS);
+        // Not a success: nothing was removed. Exiting 0 would let a script
+        // treat "printed a question" as "did the work".
+        return Err(Failure::runtime(
+            format!("{name} was not removed"),
+            "Confirm with: router rm ".to_string() + name + " --yes",
+        ));
+    }
+
+    // Stop it first, and refuse to proceed if it will not stop. Forgetting a
+    // running instance is worse than failing: the process outlives the record
+    // of it.
+    if serving {
+        if !stop_instance(instance.port).await {
+            return Err(Failure::runtime(
+                format!(
+                    "{name} is still serving on port {} and was not removed",
+                    instance.port
+                ),
+                "Stop it first with `router stop`, or find it with `router doctor`.",
+            ));
+        }
+        if style.verbosity != Verbosity::Quiet {
+            term::out(&style.dim(&format!("  Stopped {name} on port {}.", instance.port)));
+        }
     }
 
     registry.remove(name);
@@ -812,6 +849,10 @@ fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failure> {
         term::out(&style.dim(&format!(
             "  Workspace left untouched at {}",
             instance.workspace.display()
+        )));
+        term::out(&style.dim(&format!(
+            "  State left on disk at {}",
+            Registry::state_root(home.root(), name).display()
         )));
     }
     Ok(ExitCode::SUCCESS)
