@@ -17,6 +17,8 @@ router-relay.workspace = true
 router-dsh.workspace = true
 
 tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

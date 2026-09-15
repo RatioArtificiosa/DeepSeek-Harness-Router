@@ -768,12 +768,14 @@ name = "router-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "router-core",
  "router-dsh",
  "router-relay",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

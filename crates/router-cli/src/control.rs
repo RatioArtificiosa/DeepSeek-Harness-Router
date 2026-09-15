@@ -32,7 +32,43 @@ use std::process::ExitCode;
 
 use crate::Failure;
 
-/// Serve the control page until interrupted.
+/// Build the relay routes for every registered instance.
+///
+/// # Why instances are reached through the control page
+///
+/// The harness authenticates its API gateway with a cookie whose *name* is a
+/// hash of the request authority — `host:port`. Opening `127.0.0.1:3082` in a
+/// browser and reaching `127.0.0.1:3081` from it is a cross-origin request: the
+/// browser blocks it, and the cookie would not be sent even if it were allowed.
+/// The user-visible symptom is "failed to fetch gateway", which names the
+/// browser's complaint rather than its cause.
+///
+/// Serving every instance through this one origin removes the problem at the
+/// root. The browser sees a single authority and one cookie; the proxy connects
+/// to each instance's real loopback port, so the harness still sees
+/// `127.0.0.1:<its own port>` as the authority and mints a cookie that matches.
+///
+/// Prefixes are `/i/<name>`, and the prefix is stripped before forwarding,
+/// because the harness serves its app at `/` and knows nothing about being
+/// mounted under a sub-path.
+#[must_use]
+pub fn relay_routes(registry: &Registry) -> Vec<router_relay::Route> {
+    registry
+        .instances
+        .iter()
+        .map(|(name, instance)| router_relay::Route {
+            prefix: format!("/i/{name}"),
+            upstream: format!("http://127.0.0.1:{}", instance.port),
+        })
+        .collect()
+}
+
+/// Serve the control page and the instance gateway until interrupted.
+///
+/// Two jobs on one port, and they belong together: the page is how a person
+/// finds their instances, and the gateway is how they reach them without the
+/// browser refusing the request. Splitting them would mean the page linking to
+/// URLs that cannot work.
 pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, Failure> {
     let (home, registry) = crate::load(None)?;
 
@@ -58,6 +94,19 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
             style.dim(style.glyphs.arrow),
             style.url(&url)
         ));
+        if !registry.instances.is_empty() {
+            term::out("");
+            term::out(&style.dim("  Instances are reachable through this page:"));
+            for (name, instance) in &registry.instances {
+                term::out(&format!(
+                    "    {}/i/{}",
+                    url,
+                    style.paint(router_core::term::Ink::Blue, name)
+                ));
+                let _ = instance;
+            }
+        }
+        term::out("");
         term::out(&style.dim("  Press Ctrl+C to stop."));
         term::out("");
     } else {
@@ -69,33 +118,112 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
         let _ = open_page(&url);
     }
 
-    // The registry can change while the page is served, so it is re-read per
+    // The control page and the gateway share one origin.
+    //
+    // `/` renders the page; everything under `/i/<name>` is relayed to that
+    // instance. The relay already handles streaming and WebSocket upgrades,
+    // which the gateway needs — see `router_relay`.
+    let routes = relay_routes(&registry);
+
+    // The registry can change while the server runs, so the page is re-read per
     // request rather than captured once. A control page showing stale state is
     // worse than no control page.
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            continue;
-        };
+    let home_for_page = home.clone();
+    let fallback = registry.clone();
 
-        // Read fresh state, render, then write — inline rather than in a
-        // spawned task. A control page is requested by one human at a time, so
-        // concurrency here would buy nothing and complicate the borrows.
-        let fresh = Registry::load(&home.registry_path()).unwrap_or_else(|_| registry.clone());
-        let body = render(&home, &fresh);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/html; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Cache-Control: no-store\r\n\
-             Connection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
+    // The relay, if there is anything to relay.
+    //
+    // Built as a service rather than merged as a router: both halves are
+    // fallbacks, and axum refuses to merge two routers that each carry one —
+    // correctly, because one would silently shadow the other. Nesting gives the
+    // relay first refusal on every path and lets the page handle the rest.
+    let relay: Option<axum::Router> = if routes.is_empty() {
+        None
+    } else {
+        Some(router_relay::relay_router(router_relay::RelayState::new(
+            router_relay::RelayConfig {
+                // Only reached for a path the routes did not claim. Pointing it
+                // at the base port keeps the behaviour honest: an unmatched
+                // `/i/typo/...` reaches a real instance rather than a dead port.
+                upstream: format!("http://127.0.0.1:{}", registry.base_port),
+                routes,
+                ..router_relay::RelayConfig::default()
+            },
+        )))
+    };
 
-        use tokio::io::AsyncWriteExt as _;
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.shutdown().await;
-    }
+    // One origin, two jobs, and exactly one fallback.
+    //
+    // # Why the composition is this specific shape
+    //
+    // The relay and the page are both *fallbacks* — each answers "anything I do
+    // not recognise" — so they cannot be merged: axum refuses two routers that
+    // each carry a fallback, and it is right to, because one would silently
+    // shadow the other. The first attempt called `fallback_service(relay)` and
+    // then `.fallback(page)`, and the second call *replaced* the first: every
+    // request went to the page, every `/i/...` path 404'd, and the relay was
+    // never reached. The body of that 404 was the page's own text, which is how
+    // the mistake was found.
+    //
+    // So there is one fallback and it dispatches explicitly. The choice is made
+    // from the path, which keeps the precedence visible in one place rather
+    // than depending on the order axum happens to try routes.
+    let app =
+        axum::Router::new().fallback(axum::routing::any(move |req: axum::extract::Request| {
+            let home = home_for_page.clone();
+            let fallback = fallback.clone();
+            let relay = relay.clone();
+            async move {
+                let path = req.uri().path().to_string();
+
+                // An instance path goes to the relay.
+                if let Some(relay) = relay {
+                    if path.starts_with("/i/") {
+                        use tower::ServiceExt as _;
+                        return relay.oneshot(req).await.unwrap_or_else(|e| {
+                            axum::response::Response::builder()
+                                .status(axum::http::StatusCode::BAD_GATEWAY)
+                                .body(axum::body::Body::from(format!("relay failed: {e}")))
+                                .expect("a fixed response always builds")
+                        });
+                    }
+                }
+
+                // Only the root is the page. Anything else is a path nothing
+                // claims, and answering it with HTML would hide a mistyped
+                // address — the user would see the control page and wonder why
+                // their instance did not open.
+                if path != "/" {
+                    return axum::response::Response::builder()
+                        .status(axum::http::StatusCode::NOT_FOUND)
+                        .header(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; charset=utf-8",
+                        )
+                        .body(axum::body::Body::from(
+                            "Not found. The control page is at /.\n\
+                             Instances are at /i/<name>/.\n",
+                        ))
+                        .expect("a fixed response always builds");
+                }
+
+                let fresh =
+                    Registry::load(&home.registry_path()).unwrap_or_else(|_| fallback.clone());
+                let body = render(&home, &fresh);
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .header(axum::http::header::CACHE_CONTROL, "no-store")
+                    .body(axum::body::Body::from(body))
+                    .expect("a fixed response always builds")
+            }
+        }));
+
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| Failure::runtime(format!("the server stopped: {e}"), ""))?;
+
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Render the whole page.

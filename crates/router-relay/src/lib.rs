@@ -2,14 +2,22 @@
 //!
 //! # Why this exists
 //!
-//! The harness refuses to bind `0.0.0.0` — it rejects that at startup for
-//! safety, and its own documentation says the HTTP server "carries no TLS,
-//! authentication, or origin policy of its own". But publishing a container
-//! port requires listening on a non-loopback address *inside* the container.
+//! Two problems, one mechanism.
 //!
-//! Those two facts conflict, and this relay resolves it: the harness keeps its
-//! loopback bind, and the relay — the only component that ever sees a
+//! **Publishing.** The harness refuses to bind `0.0.0.0` — it rejects that at
+//! startup for safety, and its own documentation says the HTTP server "carries
+//! no TLS, authentication, or origin policy of its own". But publishing a
+//! container port requires listening on a non-loopback address *inside* the
+//! container. Those two facts conflict, and this relay resolves it: the harness
+//! keeps its loopback bind, and the relay — the only component that ever sees a
 //! non-loopback socket — forwards to it.
+//!
+//! **Several instances, one browser origin.** The harness authenticates its API
+//! gateway with a cookie whose name is derived from the request authority, so a
+//! page on one port cannot reach another port's gateway: the browser blocks the
+//! request as cross-origin, and the cookie would not be sent even if it were
+//! allowed. Serving every instance under one origin, with a path prefix each,
+//! removes the problem entirely — see [`Route`].
 //!
 //! # The two things it must not break
 //!
@@ -30,4 +38,4 @@
 
 pub mod proxy;
 
-pub use proxy::{relay_router, RelayConfig, RelayState};
+pub use proxy::{relay_router, RelayConfig, RelayState, Route};
