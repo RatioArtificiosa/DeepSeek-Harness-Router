@@ -151,6 +151,18 @@ pub enum InstanceError {
     /// No instance by that name exists.
     #[error("no instance named '{0}'")]
     Unknown(String),
+    /// The instance's workspace directory is gone.
+    ///
+    /// Its own variant rather than being folded into [`Self::Spawn`], because
+    /// the two need completely different remedies: a spawn failure means the
+    /// harness is missing or broken, while this means the project directory the
+    /// user pointed at has been deleted or moved. Reporting the second as the
+    /// first sends the user to inspect an installation that is fine.
+    #[error("the workspace {} no longer exists", .path.display())]
+    WorkspaceMissing {
+        /// The missing directory.
+        path: PathBuf,
+    },
 }
 
 impl InstanceError {
@@ -163,6 +175,29 @@ impl InstanceError {
             Self::ExitedEarly { .. } => "DSH_EXITED",
             Self::Timeout(..) => "DSH_READY_TIMEOUT",
             Self::Unknown(_) => "INSTANCE_UNKNOWN",
+            Self::WorkspaceMissing { .. } => "WORKSPACE_MISSING",
+        }
+    }
+
+    /// What the user should do about it.
+    ///
+    /// Returned as its own value rather than baked into the message, because
+    /// the remedy is the part a user acts on and the two callers (the CLI and
+    /// the health model) present it differently.
+    #[must_use]
+    pub fn remediation(&self) -> Option<String> {
+        match self {
+            Self::WorkspaceMissing { path } => Some(format!(
+                "Recreate {}, or point the instance somewhere else with \
+                 `router edit` — the router never creates or deletes a workspace.",
+                path.display()
+            )),
+            Self::Spawn(_) => Some(
+                "Install DeepSeek Harness, or set DSH_BINARY to its full path. \
+                 Run `router doctor` to see what is detected."
+                    .to_string(),
+            ),
+            _ => None,
         }
     }
 
@@ -185,6 +220,10 @@ impl InstanceError {
             Self::Unknown(name) => {
                 RuntimeFailure::new(self.code(), format!("no instance named '{name}'"))
             }
+            Self::WorkspaceMissing { path } => RuntimeFailure::new(
+                self.code(),
+                format!("the workspace {} no longer exists", path.display()),
+            ),
         }
     }
 }
@@ -330,6 +369,24 @@ impl MultiSupervisor {
         };
 
         self.set_state(name, RuntimeState::Starting).await;
+
+        // The workspace is checked before anything is provisioned or spawned.
+        //
+        // Without this, a missing workspace surfaced as `DSH_NOT_INSTALLED` with
+        // an OS error about an invalid directory name — which points the user at
+        // their harness installation, the one thing that is not wrong. The
+        // spawn fails because the *working directory* does not exist, and that
+        // is what the message must say.
+        //
+        // The check is deliberately here rather than only in the CLI: the CLI
+        // validates at `add` time, but a workspace can be deleted afterwards,
+        // and this is the last moment before a misleading failure is produced.
+        if !spec.workspace.is_dir() {
+            self.set_state(name, RuntimeState::Failed).await;
+            return Err(InstanceError::WorkspaceMissing {
+                path: spec.workspace.clone(),
+            });
+        }
 
         // Prepare the instance's own home first. This is the step that makes
         // the instance independent, so it happens before anything is spawned.

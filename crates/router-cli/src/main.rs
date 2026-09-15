@@ -215,6 +215,17 @@ const USAGE_EXIT: u8 = 2;
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // `-q` and `-v` are contradictory, and clap only catches that when both
+    // appear in the *same* scope. Because every subcommand redeclares them, the
+    // global and local copies are separate arguments: `list -q -v` was rejected,
+    // but `-q list -v` was accepted and silently resolved to quiet, discarding
+    // the `-v` the user asked for. A flag that vanishes without a word is worse
+    // than one that is refused, so the conflict is checked across both scopes
+    // here.
+    if cli.quiet && cli.verbose {
+        return usage_error("--quiet cannot be used with --verbose");
+    }
+
     let verbosity = if cli.quiet {
         Verbosity::Quiet
     } else if cli.verbose {
@@ -222,7 +233,16 @@ fn main() -> ExitCode {
     } else {
         Verbosity::Normal
     };
-    let mode = ColourMode::from_env(cli.colour.as_deref());
+
+    // An unrecognised colour mode is a typo, not a request for the default.
+    // `--colour bogus` used to fall back to `auto` silently, so a user who
+    // mistyped `always` in a script got no colour and no explanation.
+    let mode = match ColourMode::parse(cli.colour.as_deref()) {
+        Ok(m) => m,
+        Err(given) => {
+            return usage_error(&format!("invalid value '{given}' for '--colour <WHEN>'"));
+        }
+    };
     let style = Style::with_colour(mode, verbosity);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -246,6 +266,20 @@ fn main() -> ExitCode {
             ExitCode::from(failure.exit)
         }
     }
+}
+
+/// Print a usage error the way clap does, and exit with the usage code.
+///
+/// Matches clap's shape so a user cannot tell which layer rejected the input —
+/// the distinction is ours, not theirs, and two different error formats for the
+/// same class of problem is noise.
+fn usage_error(message: &str) -> ExitCode {
+    use std::io::Write as _;
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "error: {message}");
+    let _ = writeln!(err);
+    let _ = writeln!(err, "For more information, try '--help'.");
+    ExitCode::from(USAGE_EXIT)
 }
 
 /// A command failure, ready to print.
@@ -474,6 +508,18 @@ async fn cmd_add(
         ));
     }
 
+    // An empty model is a typo, not a choice. Accepting it stored `model: ''`,
+    // which is a *different* state from omitting the flag — the instance then
+    // showed a blank MODEL column rather than `default`, and the harness was
+    // handed an empty model name. Omitting the flag is how you ask for the
+    // default; saying nothing explicitly is not a third option.
+    if model.as_deref().is_some_and(str::is_empty) {
+        return Err(Failure::usage(
+            "the model name is empty".to_string(),
+            "Omit --model to use the harness default.",
+        ));
+    }
+
     // The workspace must be a real directory: the harness refuses to register a
     // workspace over a path that does not exist, so discovering that here gives
     // a better message than discovering it three layers down. Done before the
@@ -563,7 +609,13 @@ async fn cmd_add(
     }
 
     if no_start {
-        if style.verbosity != Verbosity::Quiet {
+        if style.verbosity == Verbosity::Quiet {
+            // `--quiet` promises "only the result", and for `add` the result is
+            // the port that was assigned. Printing nothing made the flag useless
+            // here: a script that asked for an instance had no way to learn
+            // where it was put.
+            term::out(&port.to_string());
+        } else {
             term::out("");
             term::out(&style.dim(&format!("  Start it with:  router start {name}")));
         }
@@ -1247,7 +1299,10 @@ async fn cmd_doctor(style: &Style) -> Result<ExitCode, Failure> {
             } else {
                 style.paint(Ink::Dim, style.glyphs.stopped)
             };
-            let state = if live { "serving" } else { "not serving" };
+            // "answering" rather than "serving": this probe proves something
+            // replies on the port, not that it is our harness. Claiming more
+            // would be the over-certification this wording exists to avoid.
+            let state = if live { "answering" } else { "not serving" };
             let state_text = if workspace_ok {
                 style.dim(state)
             } else {
@@ -1480,17 +1535,58 @@ fn unknown_instance(name: &str, registry: &Registry) -> Failure {
     Failure::usage(format!("no instance named '{name}'"), hint)
 }
 
-/// Whether something is listening on a loopback port.
+/// Whether an instance appears to be serving on a loopback port.
 ///
-/// A connection test, not a listing: the only reliable answer to "is it
-/// serving" is to ask it.
+/// # Why this does more than connect
+///
+/// A bare `connect_timeout` was unreliable enough to matter: a sweep of ~40 runs
+/// saw `status` report one instance "up" while nothing was bound, roughly three
+/// times, and `doctor` did the same once. On Windows, a socket in a transient
+/// state can accept and immediately reset, so "the connection succeeded" is not
+/// the same question as "a server is answering".
+///
+/// So the probe completes a request and requires a response. A process that
+/// accepts and then drops the connection, or that answers with nothing, is not
+/// serving by any definition a user would recognise.
+///
+/// # What this still does not prove
+///
+/// That the responder is *our* harness. Any HTTP server on the port answers this
+/// probe. Verifying identity would mean knowing the harness's own handshake,
+/// which is an interface we deliberately do not depend on. The honest position
+/// is that this reports "something is answering here", and the wording in
+/// `doctor` says so.
 fn probe_port(port: u16) -> bool {
-    std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        std::time::Duration::from_millis(300),
-    )
-    .is_ok()
+    use std::io::{Read as _, Write as _};
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
+
+    // A minimal, well-formed request. The status line is all we read — enough to
+    // prove a server replied, without parsing a body we do not understand.
+    let request = format!("GET / HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    match stream.read(&mut buf) {
+        // An HTTP status line always begins `HTTP/`. Anything else — a reset, an
+        // empty read, an unrelated protocol — is not a serving instance.
+        Ok(n) if n >= 5 => buf.starts_with(b"HTTP/"),
+        _ => false,
+    }
 }
+
+/// How long to wait for a probe to connect and answer.
+///
+/// Short, because this runs once per instance and a status command that hangs
+/// on one unresponsive port is worse than one that reports it as down. Local
+/// loopback answers in microseconds when it answers at all.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Shorten a path for display, without lying about where it is.
 ///
@@ -1630,10 +1726,43 @@ mod tests {
     }
 
     #[test]
-    fn probe_reports_a_listening_port() {
+    fn probe_reports_a_socket_that_merely_accepts_as_not_serving() {
+        // The bug this guards: `status` reported an instance "up" while nothing
+        // was bound, because a bare connect succeeded against a socket in a
+        // transient state. A listener that accepts and never replies is not
+        // serving by any definition a user would recognise, so it must not be
+        // counted as up.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert!(probe_port(port), "a bound port must probe as serving");
+        // Accepted and held, never answered.
+        let _held = std::thread::spawn(move || {
+            if let Ok((conn, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                drop(conn);
+            }
+        });
+        assert!(
+            !probe_port(port),
+            "a silent listener must not probe as serving"
+        );
+    }
+
+    #[test]
+    fn probe_reports_a_real_http_server_as_serving() {
+        // The positive case: something that actually answers HTTP.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut conn, _)) = listener.accept() {
+                let _ = conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        assert!(
+            probe_port(port),
+            "a responding HTTP server must probe as up"
+        );
+        let _ = server.join();
     }
 
     #[test]

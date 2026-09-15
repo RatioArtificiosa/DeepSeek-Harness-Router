@@ -51,14 +51,16 @@ impl ColourMode {
     ///
     /// `NO_COLOR` is honoured because it is the convention users set once and
     /// expect every tool to respect.
+    ///
+    /// An unrecognised *flag* value is an error, not a request for the default:
+    /// see [`ColourMode::parse`], which this delegates to. Only the environment
+    /// falls back silently, and that is deliberate — `NO_COLOR` is set by other
+    /// tools and by users' shell profiles, and refusing to run because of a
+    /// variable the user did not set would be hostile.
     #[must_use]
     pub fn from_env(explicit: Option<&str>) -> Self {
-        if let Some(value) = explicit {
-            return match value.to_ascii_lowercase().as_str() {
-                "always" | "true" | "yes" | "1" => Self::Always,
-                "never" | "false" | "no" | "0" => Self::Never,
-                _ => Self::Auto,
-            };
+        if let Ok(mode) = Self::parse(explicit) {
+            return mode;
         }
         if std::env::var_os("NO_COLOR").is_some()
             || std::env::var_os("DSH_ROUTER_NO_COLOR").is_some()
@@ -66,6 +68,27 @@ impl ColourMode {
             return Self::Never;
         }
         Self::Auto
+    }
+
+    /// Parse an explicit `--colour` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending string when it is not a recognised mode. The caller
+    /// turns that into a usage error, because a typo'd value silently becoming
+    /// `auto` means a script that asked for `always` gets no colour and no
+    /// explanation — the failure is invisible exactly where it matters most.
+    #[must_use = "an unrecognised value must be reported, not discarded"]
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(Self::Auto);
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "always" | "true" | "yes" | "1" => Ok(Self::Always),
+            "never" | "false" | "no" | "0" => Ok(Self::Never),
+            _ => Err(value.to_string()),
+        }
     }
 }
 
@@ -913,12 +936,49 @@ mod tests {
     }
 
     #[test]
-    fn explicit_env_parsing_covers_the_usual_spellings() {
-        assert_eq!(ColourMode::from_env(Some("always")), ColourMode::Always);
-        assert_eq!(ColourMode::from_env(Some("TRUE")), ColourMode::Always);
-        assert_eq!(ColourMode::from_env(Some("never")), ColourMode::Never);
-        assert_eq!(ColourMode::from_env(Some("0")), ColourMode::Never);
+    fn explicit_values_parse_with_the_usual_spellings() {
+        assert_eq!(ColourMode::parse(Some("always")), Ok(ColourMode::Always));
+        assert_eq!(ColourMode::parse(Some("TRUE")), Ok(ColourMode::Always));
+        assert_eq!(ColourMode::parse(Some("never")), Ok(ColourMode::Never));
+        assert_eq!(ColourMode::parse(Some("0")), Ok(ColourMode::Never));
+        assert_eq!(ColourMode::parse(Some("auto")), Ok(ColourMode::Auto));
+        assert_eq!(ColourMode::parse(None), Ok(ColourMode::Auto));
+    }
+
+    #[test]
+    fn an_unrecognised_explicit_value_is_an_error_not_a_default() {
+        // The bug this guards: `--colour bogus` silently became `auto`, so a
+        // script that mistyped `always` got no colour and no explanation — the
+        // failure invisible exactly where it matters.
+        assert_eq!(
+            ColourMode::parse(Some("bogus")),
+            Err("bogus".to_string()),
+            "a typo must be reported, not absorbed"
+        );
+        assert_eq!(
+            ColourMode::parse(Some("alwaysx")),
+            Err("alwaysx".to_string())
+        );
+        assert_eq!(ColourMode::parse(Some("")), Err(String::new()));
+    }
+
+    #[test]
+    fn a_bad_environment_value_still_falls_back() {
+        // The environment is different from a flag: `NO_COLOR` and shell
+        // profiles set variables the user did not type at this moment, and
+        // refusing to run because of one would be hostile.
+        //
+        // Held under the environment lock with `NO_COLOR` cleared, because the
+        // test runner's own environment would otherwise decide the answer — and
+        // a test whose result depends on who launched it is not a test.
+        let _guard = env_lock();
+        let previous = std::env::var_os("NO_COLOR");
+        unsafe { std::env::remove_var("NO_COLOR") };
         assert_eq!(ColourMode::from_env(Some("whatever")), ColourMode::Auto);
+        match previous {
+            Some(v) => unsafe { std::env::set_var("NO_COLOR", v) },
+            None => unsafe { std::env::remove_var("NO_COLOR") },
+        }
     }
 
     #[test]
