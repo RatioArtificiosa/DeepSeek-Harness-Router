@@ -337,7 +337,14 @@ pub fn validate_workspace(raw: &str, mode: WorkspaceMode) -> Result<WorkspacePat
     // A failure here is not fatal: the instance still works with the lexical
     // path. It only means the uniqueness check is comparing spellings, which is
     // the pre-existing behaviour and better than refusing a valid workspace.
-    let identity = std::fs::canonicalize(&absolute).unwrap_or_else(|_| absolute.clone());
+    //
+    // The verbatim prefix is stripped. On Windows `canonicalize` returns
+    // `\\?\C:\...`, a form most other programs — including the user's own shell
+    // — cannot resolve, so storing it would put a path in the registry that the
+    // user cannot paste anywhere. The prefix is an implementation detail of the
+    // call, not something the user asked to adopt.
+    let identity = std::fs::canonicalize(&absolute)
+        .map_or_else(|_| absolute.clone(), |p| strip_verbatim_prefix(&p));
 
     let docker_path = docker_form(&absolute);
     Ok(WorkspacePath {
@@ -345,6 +352,36 @@ pub fn validate_workspace(raw: &str, mode: WorkspaceMode) -> Result<WorkspacePat
         docker_path,
         identity,
     })
+}
+
+/// Remove the Windows verbatim (`\\?\`) prefix from a canonicalized path.
+///
+/// `std::fs::canonicalize` returns verbatim paths on Windows because they bypass
+/// the `MAX_PATH` limit and skip further normalisation — correct for internal
+/// use, wrong to show a user or write into a configuration file they may edit.
+///
+/// Only the plain disk form is unwrapped (`\\?\C:\...`), which is what
+/// canonicalize produces for a normal directory. UNC verbatim paths
+/// (`\\?\UNC\server\share`) are left alone: rewriting those is easy to get
+/// wrong, and silently mangling a network path would be worse than an odd-looking
+/// one.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            // Drive-letter form only: `C:\...`.
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 2 && bytes[1] == b':' {
+                return PathBuf::from(rest);
+            }
+        }
+        path.to_path_buf()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
 }
 
 /// Whether the workspace is writable, by actually attempting a write.

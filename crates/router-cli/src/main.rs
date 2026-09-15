@@ -1499,7 +1499,17 @@ async fn cmd_edit(
         Ok(())
     })?;
 
-    if style.verbosity != Verbosity::Quiet {
+    // `--quiet` prints the resulting state, tab-separated, matching what `list
+    // --quiet` emits for the same instance. The flag promises "only the result",
+    // and for a change the result is the new values — printing nothing would
+    // leave a script unable to confirm what it just set.
+    if style.verbosity == Verbosity::Quiet {
+        term::out(&format!(
+            "{name}\t{}\t{}",
+            new_model.as_deref().unwrap_or("default"),
+            if new_share { "shared" } else { "private" },
+        ));
+    } else {
         term::out(&style.ok(&format!("Updated {}", style.strong(name))));
         match (&model, clear_model) {
             (Some(_), true) => term::out(&style.field("model", "cleared (harness default)")),
