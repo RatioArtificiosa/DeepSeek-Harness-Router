@@ -12,7 +12,7 @@ sessions and its own settings — reachable from a single local page.
 [![License: MIT](https://img.shields.io/badge/License-MIT-4f8cff.svg?style=flat-square)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/core-Rust-f74c00.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Harness](https://img.shields.io/badge/harness-0.1.x-37e0c8.svg?style=flat-square)](docs/dsh-compatibility.md)
-[![Tests](https://img.shields.io/badge/tests-287%20passing-3ecf8e.svg?style=flat-square)](#quality)
+[![Tests](https://img.shields.io/badge/tests-289%20passing-3ecf8e.svg?style=flat-square)](#quality)
 [![Status: working](https://img.shields.io/badge/status-working-3ecf8e.svg?style=flat-square)](#project-status)
 
 <br>
@@ -53,7 +53,7 @@ $ router status
 2 up  |  0 down
 
 $ router open notes
-OK Opened http://127.0.0.1:3090/i/notes/
+OK Opened http://127.0.0.1:3083/?token=…
 ```
 
 Two agents, two projects, two models, running at the same time. One page reaches
@@ -72,9 +72,9 @@ OK Control page ready
     http://127.0.0.1:3090/i/notes
 ```
 
-Everything lives on **one origin**. That is not cosmetic — it is the reason a
-browser can talk to all of them at once. See
-[why one origin matters](#why-one-origin-matters).
+Everything lives on **one origin** for browsing, and each instance keeps its own
+origin for work. Both matter, for different reasons — see
+[why origins matter](#why-origins-matter).
 
 ---
 
@@ -227,40 +227,49 @@ one instance falling over does not touch the others.
 authority, so the browser treats every instance as the same site.
 
 <details>
-<summary><b>Why one origin matters</b></summary>
+<summary><b>Why origins matter</b></summary>
 
 <br>
 
 This is the least obvious part of the design, and the part that took the longest
-to get right.
+to get right. There are two facts pulling in opposite directions.
 
-The harness authenticates its API with a cookie whose **name is derived from the
-request authority** — `host:port` — and whose signed payload pins that same
-authority. A page served from `127.0.0.1:3082` calling a gateway on
-`127.0.0.1:3083` is therefore a different origin in both senses the browser
-cares about: the request is blocked as cross-origin, and the cookie would not be
-sent even if it were allowed.
+**The control page needs one origin.** The harness authenticates its API with a
+cookie named after the request authority — `host:port` — and signed with that
+same authority. A page served from `127.0.0.1:3082` calling a gateway on
+`127.0.0.1:3083` is a different origin in both senses the browser cares about: the
+request is blocked as cross-origin, and the cookie would not be sent even if it
+were allowed. The symptom is *"failed to fetch gateway"*, which names the
+browser's complaint rather than its cause.
 
-The symptom is an error the harness reports as *"failed to fetch gateway"* —
-which names the browser's complaint rather than its cause, and sends you looking
-at the wrong thing entirely.
+So the control page serves every instance under `/i/<name>/` on its own address,
+and the proxy connects to each instance's real loopback port. The harness still
+sees `127.0.0.1:<its own port>` as its authority and mints a cookie that matches.
 
-Serving every instance under one origin removes the problem at the root. Each
-instance is reachable at `/i/<name>/` on the control page's own address. The
-proxy connects to the instance's real loopback port, so the harness still sees
-`127.0.0.1:<its own port>` as its authority and mints a cookie that matches.
+**Working sessions need separate origins.** That same authority-signing means a
+single origin can hold only *one* authenticated session. Through one origin,
+logging into a second instance replaces the first one's cookie, and the first tab
+begins failing with 401s that point nowhere near the cause.
 
-Three details have to be right, and all three fail silently:
+A port is an origin, so `router open` uses the instance's own port by default.
+Two tabs on two ports each hold their own session and coexist. `--via-gateway`
+opts into the single-origin view when you want it, with that trade-off stated in
+its help text.
+
+Three details in the proxy fail silently when wrong, and all three are covered by
+tests:
 
 - **Root-absolute URLs.** The harness's shell mixes `./assets/…` (fine) with
-  `/plugins/??…` and `href="/"`, which would resolve against the gateway and
-  404. HTML responses are rewritten so they stay inside the instance.
-- **Compressed responses.** Rewriting compressed bytes corrupts them. The relay
-  declines `Accept-Encoding` for navigations and confirms the encoding before
-  touching a body.
+  `/plugins/??…` and `href="/"` plus an inline `window.__DSH_BOOT__` naming about
+  fifty plugins. Through the gateway those resolve against the wrong origin, so
+  the page loads its shell and none of its behaviour. HTML responses are
+  rewritten to keep them inside the instance.
+- **Compressed responses.** Rewriting compressed bytes corrupts them, and the
+  browser then refuses the page entirely. The relay declines `Accept-Encoding`
+  for navigations and confirms the encoding before touching a body.
 - **Runtime-constructed URLs.** The live agent socket is built in JavaScript from
-  the origin, so no response rewrite can reach it. The gateway records which
-  instance a browser opened and routes those requests back to it.
+  the origin, so no response rewrite can reach it. Those requests are routed by
+  their `Referer`, which the browser sets per request.
 
 </details>
 
@@ -298,7 +307,7 @@ The things this project is careful about, stated plainly:
 | Two instances never share a state root | One `DSH_HOME` per instance, validated on registration |
 | No personal or machine information in this repository | Enforced by the working rules in [`AGENTS.md`](AGENTS.md) |
 
-**287 tests**, `cargo clippy --workspace --all-targets -- -D warnings` clean,
+**289 tests**, `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo fmt --check` clean. Every non-obvious decision is commented with *why*,
 and the tests that guard a past defect were each confirmed to fail without the
 fix — a test that cannot fail proves nothing.
