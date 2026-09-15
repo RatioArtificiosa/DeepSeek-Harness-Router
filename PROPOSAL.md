@@ -17,6 +17,23 @@
 
 ---
 
+| **2.0.0** | **The product was misunderstood and is restated.** This is not a Docker distribution for the public. It is a **local multi-instance router** that runs several DeepSeek Harness instances on one machine, each on its own port, workspace, and model. Docker is a **build-time laboratory**, not the delivery mechanism. |
+
+---
+
+> # ⚠️ READ §P-48 FIRST
+>
+> **The current design begins at §P-48.** Sections §P-01 … §P-47 were written for
+> a superseded premise: a publicly-distributed Docker package. They are retained
+> because they contain verified research about the harness — the storage and
+> session survey, the sandbox probes, the streaming-proof tests — that the
+> current design still relies on.
+>
+> **Where an old section conflicts with §P-48 onward, §P-48 onward wins.**
+> §P-53.2 names exactly which old conclusions are retired, so no reader mistakes
+> a superseded conclusion for a current one.
+
+---
 ## How to read this document
 
 Every checklist item in `CHECKLIST.md` carries a reference of the form **→ §P-XX.Y**. That reference points at a numbered section of *this* document. Before executing any checklist line, read the referenced section: it contains the rationale, the constraints, the exact commands, and the acceptance criteria for that line.
@@ -4205,3 +4222,530 @@ one place, instead of editing YAML.
 
 That is a §P-27.2 environment-transparency feature, not a new subsystem — which
 keeps the anti-goal of §P-27.1 intact.
+
+---
+
+# PART VII — THE REAL PRODUCT
+
+
+## §P-48 — What we are actually building
+
+### §P-48.1 The product in one sentence
+
+> **A local control plane that runs several DeepSeek Harness instances at once —
+> each on its own port, in its own workspace, with its own model — so you can
+> work on multiple projects in parallel without them interfering.**
+
+### §P-48.2 The user story
+
+A developer has four things going:
+
+- a Rust project that needs a long refactor,
+- a Python service that needs tests written,
+- a research folder where they want a different, cheaper model,
+- and a scratch workspace for experiments.
+
+Today they can run **one** harness. Opening a second either fights for the port
+or — worse — silently shares state and can corrupt it.
+
+With the Router:
+
+```text
+$ router start rust-refactor          →  http://127.0.0.1:3081
+$ router start py-service             →  http://127.0.0.1:3082
+$ router start research               →  http://127.0.0.1:3083
+$ router list
+  NAME            PORT   WORKSPACE          MODEL              STATE
+  rust-refactor   3081   ~/projects/rust    deepseek-v4-pro    ready
+  py-service      3082   ~/services/py      deepseek-v4-pro    ready
+  research        3083   ~/notes            deepseek-v4-flash  ready
+```
+
+Each is a full, independent harness with its own UI, sessions, credentials if
+configured so, and model. They run simultaneously. Closing one does not touch
+the others.
+
+### §P-48.3 Docker's actual role
+
+| Phase | Environment | Why |
+|---|---|---|
+| **Build and test** | **Docker** | The owner's machine has a live harness installation in daily use. Developing against it risks breaking it. A container is a clean room where mistakes are free. |
+| **Run** | **Native, on the owner's machine** | The product's purpose is to drive the *real* harness, installed natively. |
+
+This corrects §P-43: Docker-first was right for *how we work*, and wrong for
+*what we ship*.
+
+> **Consequence:** every constraint written for a containerized deployment —
+> bind mounts, `/workspace`, published ports, the relay solving `--host 0.0.0.0`
+> — applies only insofar as it helps the lab.
+
+### §P-48.4 What this product is not
+
+- Not a Docker distribution.
+- Not for other people's computers.
+- Not a fork of the harness.
+- Not a replacement UI — the harness GUI is the UI.
+
+---
+
+## §P-49 — Research findings: how the harness actually isolates
+
+Everything here was verified against the installed package and the owner's live
+installation on 2026-09-15.
+
+### §P-49.1 The state root: one variable controls everything
+
+`dsh` resolves all user data from a single root, in this precedence:
+
+```text
+explicit config  >  $DSH_HOME  >  ~/.dsh
+```
+
+Confirmed from `@deepseek-ai/dsh-home-paths`:
+
+> *"An explicit path wins over `$DSH_HOME`, which wins over `~/.dsh`; blank
+> environment values are ignored."*
+
+**This is the lever the whole design turns on.** Setting `DSH_HOME` per instance
+gives that instance its own everything.
+
+### §P-49.2 What lives under the state root
+
+Observed in the live installation:
+
+| Path | Contents | Shared-state risk |
+|---|---|---|
+| `settings.yaml` | Model selection, UI preferences | **Whole-file rewrite** |
+| `.credentials.yaml` | API keys | **Whole-file rewrite** |
+| `storages/workspace.json` | The workspace registry | **Whole-file rewrite** |
+| `storages/session_projcache/` | One JSON file per session | Per-file writes into a shared directory |
+| `sessions/<mangled-path>/` | Session logs, grouped by project directory | Separate files |
+| `profiles/` | Plugin compositions | Read-mostly |
+| `attachments/`, `browser-sessions/` | Uploads, browser state | Separate files |
+
+### §P-49.3 The collision finding — the problem this product exists to solve
+
+**Session IDs do not collide.** They are `session-<uuid v4>`.
+
+**The shared mutable state does collide.** The harness documents this itself.
+From `@deepseek-ai/dsh-storage-json`:
+
+> *"**No cross-process write locking** — two processes writing the same unit can
+> interleave replacements; writes to the same file use **last-completion wins**."*
+
+From `@deepseek-ai/dsh-session-persistence`:
+
+> *"Write ownership is **in-process only**… **the durable cross-process lease is
+> the planned next layer**… and **until it lands another process must not write
+> the same session**."*
+
+From `@deepseek-ai/dsh-session-query-sqlite`:
+
+> *"**Single-owner derived index** — one service in one process must own each
+> index path; external writers and multi-process sharing are unsupported."*
+
+**This is live on the owner's machine right now.** Two harness processes are
+running, both started without `DSH_HOME`, so both resolved to `~/.dsh`:
+
+```text
+PID 38368   dsh web --no-open              (port 3080, started 06:32)
+PID 51092   dsh web --port 3081 --no-open  (port 3081, started 15:59)
+
+Both share:  ~/.dsh/storages/workspace.json
+             ~/.dsh/storages/session_projcache/
+             ~/.dsh/settings.yaml
+             ~/.dsh/.credentials.yaml
+```
+
+The workspace registry currently holds four workspaces written by both
+processes. No corruption has been observed — but the mechanism is
+last-writer-wins over one file, so a lost workspace registration or a clobbered
+setting is possible at any time, silently.
+
+> **The Router's reason to exist, stated precisely:** it gives each instance its
+> own state root, eliminating this entire class of failure by construction
+> rather than by hoping writes do not overlap.
+
+### §P-49.4 The workspace model, in full
+
+The GUI and host share one workspace concept, stored in `storages/workspace.json`:
+
+```jsonc
+{
+  "unit": { "name": "workspace", "version": 2 },
+  "global": {
+    "initialized": true,
+    "workspaceIds": ["36d57adc-…", "4247a215-…"],   // display order
+    "archivedSessionIds": ["session-1ebc950c-…"]
+  },
+  "tables": {
+    "workspaces": {
+      "36d57adc-…": {
+        "path": "G:\\DeepSeek Router",     // canonical realpath
+        "title": "DeepSeek Router",        // defaults to the last path segment
+        "sessionIds": ["session-09c45d42-…"],
+        "createdAt": "2026-09-14T23:56:26.08Z",
+        "updatedAt": "2026-09-14T23:56:26.376Z"
+      }
+    }
+  }
+}
+```
+
+Verified behaviours, from `@deepseek-ai/dsh-workspace`:
+
+| Behaviour | Detail |
+|---|---|
+| **Identity** | A generated `WorkspaceId` uuid, **never the path** — normalization rewrites paths, but a reference anchor must stay stable |
+| **Uniqueness** | `fs.realpath` is the one canon; uniqueness is string equality of canonical paths |
+| **Creation** | Requires a fully qualified path to an existing directory; rejects relative, drive-relative, missing, and file paths |
+| **Session membership** | A session joins when its header `cwd` canonicalizes to the workspace path; ownership is the record's ordered `sessionIds`, re-validated against the header |
+| **Grouping** | Sessions group under a human-readable project directory derived from the path |
+| **Deletion** | Removing a workspace never deletes the folder, files, or sessions — they become ungrouped |
+| **Bootstrap** | On first start, history is grouped from persisted session headers alone |
+
+**Session directory encoding.** Session logs live under `sessions/<encoded-path>/`,
+where the path is mangled into a directory name — `G:\DeepSeek Router` becomes
+`--G-DeepSeek~0020Router--`, spaces escaped as `~0020`. This is derived, not
+authoritative: the registry's `path` field is the source of truth.
+
+### §P-49.5 How the GUI connects to a workspace and a model
+
+| Concern | Mechanism | Verified in |
+|---|---|---|
+| **Opening a workspace** | `ctx.workspaceController` exposes `create`, `rename`, `delete`, `insertBefore`, `follow` over the Remote wire | `dsh-api-workspace-controller` |
+| **Creating a session in it** | The gateway resolves the new session's `cwd` from the chosen workspace's `path`, creates the session so the cwd lands in its immutable header, then attaches it | `dsh-workspace`, `dsh-api-session-controller` |
+| **Choosing a model** | `ctx.agentDefaultModel.currentSelection()` / `saveSelection()` — a **process-wide default**, overridden per session by the creating entry point | `dsh-agent-default-model` |
+| **Model persistence** | The `agent-default-model` settings section in `settings.yaml` | same |
+| **Per-session model** | A session that has already sent a request keeps the model recorded in its own log | `providers.md` |
+
+> **The critical constraint:** the default model is **process-wide**. Two
+> instances with different models in one process is not supported. Different
+> models therefore require **different processes** — which is what the Router
+> launches.
+
+### §P-49.6 How a harness instance is launched
+
+Verified from the installed CLI:
+
+```sh
+dsh web --host 127.0.0.1 --port 3081 --no-open --trusted-host <authority>
+```
+
+| Element | Source | Notes |
+|---|---|---|
+| `--port <n>` | App flag, passed through the launcher | `0` requests an OS-assigned port |
+| `--host <h>` | App flag | Accepts only `127.0.0.1`; `0.0.0.0` is rejected |
+| `--no-open` | App flag | Prevents a browser handoff the router must own |
+| `--trusted-host <a>` | App flag, repeatable | Extra authorities for the browser-trust fence |
+| `DSH_HOME` | **Environment variable** | The state root — the isolation lever |
+| Invoking directory | Process cwd | The default workspace root |
+
+**Readiness signal.** The web bundle prints a `dsh web:` line carrying an
+authenticated URL, but **only after** the plugin tree settles and connection
+authentication is available. That is a real signal, and the Router binds to it
+rather than sleeping.
+
+### §P-49.7 The per-instance state root, resolved
+
+Combining the above, one instance is fully described by:
+
+```text
+instance "rust-refactor"
+  DSH_HOME      ~/.deepseek-router/instances/rust-refactor/dsh
+  cwd           ~/projects/rust
+  port          3081
+  model         (from that home's settings.yaml)
+```
+
+Every mutable file the harness touches now lives under that instance's own home.
+Two instances cannot interleave writes because **they never open the same file**.
+
+---
+
+## §P-50 — The multi-instance architecture
+
+### §P-50.1 Isolation model
+
+```text
+                    ┌─────────────────────────────────────────┐
+                    │  ~/.deepseek-router/                    │
+                    │                                         │
+                    │   router.yaml        ← the registry     │
+                    │   logs/                                 │
+                    │                                         │
+                    │   instances/                            │
+                    │     rust-refactor/                      │
+                    │       dsh/           ← DSH_HOME         │
+                    │         settings.yaml                   │
+                    │         .credentials.yaml               │
+                    │         storages/workspace.json         │
+                    │         sessions/                       │
+                    │     py-service/                         │
+                    │       dsh/           ← its own DSH_HOME  │
+                    └─────────────────────────────────────────┘
+```
+
+Each instance gets:
+
+| Resource | Isolation | Mechanism |
+|---|---|---|
+| **State root** | Fully independent | `DSH_HOME` per instance |
+| **Workspace registry** | Independent | separate `workspace.json` |
+| **Sessions** | Independent | separate `sessions/` tree |
+| **Settings + credentials** | Independent by default | separate `settings.yaml`, `.credentials.yaml` |
+| **Model default** | Independent | process-wide, so separate processes |
+| **Port** | Unique | allocated by the router |
+| **Process** | Separate OS process | one `dsh` child per instance |
+
+> **Why separate credentials by default?** A shared credential file is a
+> whole-file rewrite, and it is the file a user would least like to lose to a
+> last-writer-wins race. An instance may **opt in** to sharing (§P-52.4).
+
+### §P-50.2 Why one process per instance, not one process with many workspaces
+
+The harness already supports many workspaces in one process. Why not use that?
+
+| Requirement | One process | One process per instance |
+|---|---|---|
+| Several workspaces | ✅ native | ✅ native |
+| **Several models at once** | ❌ **default is process-wide** | ✅ each process has its own |
+| **Independent credentials** | ❌ shared file | ✅ separate files |
+| **Independent settings/plugins** | ❌ shared file | ✅ separate files |
+| **Crash isolation** | ❌ one crash ends all | ✅ others unaffected |
+| **Independent restarts** | ❌ | ✅ |
+| **Per-instance resource limits** | ❌ | ✅ |
+
+**Verified constraint:** `dsh-agent-default-model` documents *"One process-wide
+default — the service owns a single default."*
+
+So *"run different models in parallel"* **cannot** be met in one process.
+Separate processes are not a preference; they are the only way to satisfy the
+requirement.
+
+### §P-50.3 The control plane
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  router (Rust)                                                │
+│                                                               │
+│   registry      router.yaml — instances, ports, workspaces    │
+│   supervisor    spawn / stop / restart / health-watch         │
+│   allocator     port assignment, collision avoidance          │
+│   proxy         optional stable URL per instance              │
+│   control UI    one page listing every instance and its state │
+│   cli           start / stop / status / logs / open           │
+└───────────┬───────────────────────────────────────────────────┘
+            │  one child process per instance
+            ▼
+   dsh web --port 3081 --no-open   (DSH_HOME=…/rust-refactor/dsh)
+   dsh web --port 3082 --no-open   (DSH_HOME=…/py-service/dsh)
+```
+
+### §P-50.4 Port allocation
+
+| Rule | Detail |
+|---|---|
+| **Base** | 3080, matching the harness default — but the owner's existing install already holds it |
+| **First router instance** | **3081 and up** (owner's instruction: *"the router would make new ones 3081 and up"*) |
+| **Selection** | The lowest free port at or above the base, skipping ports already held by a router instance |
+| **Verification** | A port is claimed only after an actual **bind test** succeeds; a `netstat` reading is a hint, never proof |
+| **Stability** | A port is **remembered** for an instance across restarts, so a bookmarked URL keeps working |
+| **Release** | A stopped instance releases its port but retains the assignment, so restarting reclaims it when free |
+| **Conflict** | If a remembered port is taken by a foreign process, the router reports it, picks another, and says so |
+
+---
+
+## §P-51 — The control area
+
+*The owner asked for "some kind of control area."* Two surfaces, one model.
+
+### §P-51.1 The CLI — the primary interface
+
+```text
+router init                          create the router home and registry
+router list                          every instance and its state
+router add <name> --workspace <dir>  register and start a new instance
+router start <name>                  start a stopped instance
+router stop <name>                   stop one instance
+router restart <name>                restart one instance
+router open <name>                   open that instance's UI
+router logs <name> [-f]              read or follow its output
+router rm <name>                     unregister (never deletes a workspace)
+router status                        summary; non-zero exit if any instance is down
+router doctor                        diagnostics; changes nothing
+```
+
+### §P-51.2 The control page — the secondary interface
+
+A single local page aggregating every instance:
+
+```text
+  DeepSeek Harness Router                                   4 instances
+
+  ● rust-refactor    :3081   ~/projects/rust      v4-pro     up 2h 14m
+  ● py-service       :3082   ~/services/py        v4-pro     up 1h 03m
+  ● research         :3083   ~/notes              v4-flash   up 41m
+  ○ experiments      :3084   ~/scratch           —          stopped
+
+  [ open ]  [ stop ]  [ logs ]  [ restart ]        per row
+```
+
+**Design intent:** answer *"what is running, where, and on what?"* in one glance,
+then get out of the way. It is not a second agent UI — that would duplicate the
+harness GUI, which §P-27.1 already forbids.
+
+> **Implementation note.** The control page is served by the Router's own small
+> HTTP server on its own port, keeping it entirely separate from the instances
+> it supervises. A harness client plugin (§P-46) remains a valid later
+> refinement, but it would place the control plane *inside* one of the things it
+> supervises — a dependency inversion worth avoiding for the control path.
+
+---
+
+## §P-52 — Instance configuration
+
+### §P-52.1 The registry file
+
+`~/.deepseek-router/router.yaml`:
+
+```yaml
+version: 1
+base_port: 3081
+
+instances:
+  rust-refactor:
+    workspace: ~/projects/rust          # expanded and canonicalized at creation
+    port: 3081                           # remembered across restarts
+    model: deepseek-v4-pro               # written into the instance's settings
+    autostart: false
+    share_credentials: false
+    env: {}                              # extra environment variables
+
+  research:
+    workspace: ~/notes
+    port: 3083
+    model: deepseek-v4-flash
+```
+
+### §P-52.2 The per-instance home
+
+Created on first start, seeded with the minimum the harness needs:
+
+```text
+<router-home>/instances/<name>/dsh/
+├── settings.yaml          ← populated with the instance's model selection
+├── .credentials.yaml      ← created empty unless sharing is enabled
+├── storages/              ← created by the harness
+├── sessions/              ← created by the harness
+└── profiles/              ← created by the harness
+```
+
+**The instance's `settings.yaml` is written by the Router at creation**, so the
+model is set before the harness first boots. This avoids the trap where a user
+must open each instance's GUI and pick a model by hand.
+
+### §P-52.3 Workspace binding
+
+At instance creation:
+
+1. The workspace path is resolved, canonicalized, and validated.
+2. The directory must exist (the harness refuses a nonexistent workspace).
+3. The harness is started with that directory as its **working directory**,
+   which is how it learns its default workspace root.
+4. Registration into the instance's own workspace registry then happens through
+   the normal GUI flow, or programmatically via the workspace API.
+
+> **Why the working directory matters:** the harness uses its invoking directory
+> as the default workspace root. Setting cwd at spawn is simpler and more robust
+> than any post-hoc API call.
+
+### §P-52.4 Credentials: separate by default, shareable by choice
+
+| Mode | Mechanism | When to choose it |
+|---|---|---|
+| **Separate** (default) | Each instance has its own `.credentials.yaml` | Isolation; different keys per project |
+| **Shared** | The instance's credentials file is a **symlink** to the host's | One key for everything; set up once |
+
+`share_credentials: true` creates a symlink rather than copying, so a rotated key
+reaches every instance on its next request.
+
+> **Honest caveat:** the harness resolves credentials per operation and does not
+> cache them, so rotation needs no restart. But a symlink means concurrent writes
+> to one file — acceptable for the read-mostly pattern here, and the reason
+> sharing is **opt-in**.
+
+---
+
+## §P-53 — What carries over from versions 1.x
+
+### §P-53.1 Still true, still used
+
+| Finding | Section | Why it still matters |
+|---|---|---|
+| The **SDK wire protocol** is newline-delimited JSON-RPC over stdio | §P-42.3 | A future `router attach` could drive a harness without the GUI |
+| The **readiness signal** is the `dsh web:` URL line | §P-11.4 | The supervisor waits on the real signal, never a sleep |
+| **Session format** is JSONL with Zstandard frames | §P-03.6 | Relevant if the router inspects or migrates session stores |
+| The **workspace registry** semantics | §P-49.4 | Drives workspace binding and the control page |
+| The **model default** is process-wide | §P-49.5 | The reason one process per instance is mandatory |
+| **Landlock/bwrap** confinement findings | §P-18 | Relevant if the router spawns confined children |
+| **Rust** as the core language | §P-42 | Still justified: process supervision and concurrency are the core work |
+| **Vision / image input** findings | §P-47 | Unchanged and still accurate |
+
+### §P-53.2 Retired
+
+| Retired | Because |
+|---|---|
+| Containerized deployment, Compose files | The product is not shipped in Docker |
+| The loopback relay solving `--host 0.0.0.0` | Native loopback needs no such workaround |
+| Bind mounts, `/workspace`, `agent-data` volume | No container in the runtime path |
+| Cross-platform launchers as the primary interface | The `router` binary is the interface |
+| The public README as a marketing landing page | **Tone kept** (owner's instruction); Docker details replaced |
+| The private installer as a *later* phase | It is now the **delivery mechanism**, not a side quest |
+
+### §P-53.3 Code disposition
+
+| Crate | Verdict | Reason |
+|---|---|---|
+| `router-core` | **Keep** | Error codes, config, health, and workspace path validation are all in scope — validating N workspace paths is squarely needed |
+| `router-relay` | **Keep** | A streaming HTTP proxy serves the control page and any stable-URL feature; the streaming and header work is directly reusable |
+| `router-dsh` | **Rework** | Readiness parsing and the state machine are right; the single-child supervisor becomes a multi-child supervisor |
+| `router-cli` | **Redirect** | Becomes the `router` command, not a container entrypoint |
+
+---
+
+## §P-54 — Risks of the new design
+
+| ID | Risk | Mitigation |
+|---|---|---|
+| **RSK-30** | **Port collisions with the owner's existing harness on 3080** | The router never assigns 3080 by default; it starts at 3081. A bind test, not a guess, confirms a port is free. |
+| **RSK-31** | **A user points two instances at the same workspace** | Two agents editing one tree concurrently is a real hazard. The router **detects and warns**; it does not silently allow it. |
+| **RSK-32** | **Resource exhaustion from many instances** | Each harness is a Node process. The router reports per-instance memory and refuses to start beyond a configurable ceiling. |
+| **RSK-33** | **Orphaned harness processes** | A harness outliving its router. The registry records PIDs; `router doctor` reports orphans, and startup adopts or reaps them. |
+| **RSK-34** | **The router becoming a single point of failure** | Instances are independent OS processes. If the router dies, running instances keep serving; it recovers its view from the registry and PID checks on restart. |
+| **RSK-35** | **Model misconfiguration discovered late** | The instance's settings are written before first boot, and `router doctor` validates the configured route exists. |
+
+---
+
+## §P-55 — Definition of done
+
+The milestone is complete only when, on the owner's machine, unattended:
+
+1. `router init` creates the router home.
+2. `router add a --workspace <dirA>` starts an instance on 3081.
+3. `router add b --workspace <dirB> --model <other>` starts one on 3082.
+4. Both UIs open and show **different workspaces**.
+5. Both report **different models**.
+6. Each has its **own session list**, and neither sees the other's sessions.
+7. Writing a session in A does not alter B's `workspace.json`.
+8. `router list` shows both, correct port, workspace, model, state.
+9. `router stop a` leaves B serving.
+10. `router restart a` reclaims 3081.
+11. The owner's original install on 3080 is **untouched** throughout.
+
+**Item 7 is the acceptance test for the entire design.** It is the property the
+harness cannot provide on its own and the reason this product exists.
+
+---
+
+
