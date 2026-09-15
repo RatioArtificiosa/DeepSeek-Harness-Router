@@ -411,6 +411,29 @@ fn descendants_of(pid: u32, _depth: u32) -> Vec<u32> {
     vec![pid]
 }
 
+/// The PID holding a port, when there is exactly one.
+///
+/// Used to record who the listener actually is, once the port answers. The PID
+/// captured at spawn time is not that process on Windows: the router spawns the
+/// `dsh.cmd` shim, the shim starts `node`, and the shim then exits — so the
+/// recorded number belongs to a process that no longer exists while a different
+/// one holds the port.
+///
+/// Returns `None` when there is no single answer: nothing is listening, the query
+/// failed, or several PIDs claim the port (which happens briefly while one socket
+/// closes and another opens). A caller must treat `None` as "unknown", never as
+/// "not ours" — the distinction decides whether an instance is adopted or refused.
+#[must_use]
+pub fn listener_pid_on(port: u16) -> Option<u32> {
+    let pids = listeners_on(port)?;
+    match pids.as_slice() {
+        [only] => Some(*only),
+        // Ambiguous: refuse to guess. Recording the wrong PID would make a later
+        // restart adopt or refuse the wrong process.
+        _ => None,
+    }
+}
+
 /// PIDs listening on a port, or `None` if the query itself failed.
 ///
 /// `None` and an empty list mean different things: "I could not find out" versus

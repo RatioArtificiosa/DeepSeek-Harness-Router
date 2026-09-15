@@ -702,6 +702,25 @@ impl MultiSupervisor {
             guard.status.ready_in_ms = elapsed;
             guard.status.version = version;
             guard.status.state = RuntimeState::Ready;
+
+            // Re-record the PID, now that the port is answering, with the
+            // process that actually holds it.
+            //
+            // The PID written at spawn time belongs to the `dsh.cmd` shim on
+            // Windows, and that shim *exits* once it has started `node`. A dead
+            // PID has no descendants, so a later restart could not recognise its
+            // own instance and would refuse it as a foreign conflict — the
+            // ownership check failing in the opposite direction from the bug it
+            // was written for.
+            //
+            // Captured here rather than at spawn because this is the first
+            // moment the listener exists and can be identified.
+            if let Some(listener) = crate::process::listener_pid_on(port) {
+                let dir = instance_dir_of(&guard.spec.state_root);
+                if let Err(e) = crate::browser::write_pid(&dir, listener) {
+                    tracing::debug!(error = %e, "could not record the listener pid");
+                }
+            }
         }
         self.publish().await;
         true

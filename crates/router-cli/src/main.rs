@@ -707,13 +707,21 @@ async fn start_one(
                     }
                     u
                 }
-                None => {
-                    term::err(&style.warn(
-                        "  the harness did not announce a browser URL, so \
-                         `router open` will not work for this instance",
-                    ));
-                    format!("http://127.0.0.1:{}", instance.port)
-                }
+                // Nothing was announced this run, but an adopted instance already
+                // has a URL recorded from when it started. Reusing it is the
+                // honest answer: the harness is still the same process, so its
+                // token is still valid. Warning that `open` will not work, when a
+                // working URL is sitting on disk, would be a false alarm.
+                None => match router_dsh::browser::read(&home.instance_dir(name)) {
+                    Some(u) if router_dsh::browser::has_token(&u) => u,
+                    _ => {
+                        term::err(&style.warn(
+                            "  the harness did not announce a browser URL, so \
+                             `router open` will not work for this instance",
+                        ));
+                        format!("http://127.0.0.1:{}", instance.port)
+                    }
+                },
             };
             if style.verbosity == Verbosity::Quiet {
                 term::out(&url);

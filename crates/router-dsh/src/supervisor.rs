@@ -470,6 +470,13 @@ impl Supervisor {
             // process handle is not possible, so the caller keeps ownership and
             // this only records that a child exists.
             let _ = child.id();
+            // Also record the process that actually holds the port. On Windows
+            // the spawned child is the `dsh.cmd` shim, which exits once it has
+            // started `node`; the listener is a different, longer-lived process,
+            // and it is the one a later restart must recognise as ours.
+            if let Some(listener) = crate::process::listener_pid_on(self.config.internal_port) {
+                inner.status.pid = Some(listener);
+            }
             inner.status.state = RuntimeState::Ready;
         }
 
