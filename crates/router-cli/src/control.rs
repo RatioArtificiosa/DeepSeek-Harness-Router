@@ -383,7 +383,14 @@ fn render_warning(missing: &[&str]) -> String {
 /// One instance row.
 fn render_row(name: &str, instance: &Instance, serving: bool, home: &RouterHome) -> String {
     let workspace_ok = instance.workspace.is_dir();
-    let url = format!("http://127.0.0.1:{}", instance.port);
+    // The link is root-relative and goes through this page's own origin, not
+    // the instance's bare port. A direct `127.0.0.1:<port>` link looks like it
+    // should work and does not: the harness names its auth cookie after the
+    // request authority, so a page reached that way cannot talk to a gateway
+    // that mints the cookie for a different one. The user-visible result was
+    // "failed to fetch gateway" — which is why `/i/<name>` exists, and why the
+    // link has to use it. Being relative, it also cannot hard-code a host.
+    let url = format!("/i/{name}");
 
     // State is carried by a word and a shape, not by colour alone — a
     // colour-blind reader must get the same information.
@@ -406,9 +413,12 @@ fn render_row(name: &str, instance: &Instance, serving: bool, home: &RouterHome)
 
     // A serving instance links; a stopped one does not, because a link that
     // leads nowhere is worse than no link.
+    //
+    // The tooltip still names the port, because that is what a user needs when
+    // they go looking for the process — but it is deliberately not the link.
     let port_cell = if serving {
         format!(
-            r#"<a class="port" href="{url}" title="Open the UI for {name}">{port}</a>"#,
+            r#"<a class="port" href="{url}" title="Open {name} (its own port is {port})">{port}</a>"#,
             url = html_escape(&url),
             name = html_escape(name),
             port = instance.port
@@ -800,6 +810,79 @@ mod tests {
             .unwrap();
         let two = render(&home(), &registry);
         assert!(two.contains(">1<"), "the instance count must be shown");
+    }
+
+    /// Start a throwaway HTTP server and return the port it listens on.
+    ///
+    /// The page decides "serving" by probing for an HTTP status line, so a bare
+    /// listening socket reads as stopped. A test that wants a serving row has to
+    /// answer like a server, not merely accept a connection.
+    fn spawn_http_responder() -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            // A few probes happen per render; serve them all, then end when the
+            // test drops the listener by returning from this closure.
+            for stream in listener.incoming().take(4) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                let _ = stream.flush();
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn a_serving_instance_links_through_the_gateway_prefix() {
+        // The link must not point at the instance's bare port. Reaching a
+        // gateway from a page served on another authority is what produced
+        // "failed to fetch gateway", and the port link recreates exactly that
+        // situation — it looks correct and cannot work.
+        let name = "linked-instance";
+        let (port, server) = spawn_http_responder();
+        let mut registry = Registry::default();
+        registry
+            .insert(name, Instance::new(PathBuf::from("/tmp/linked"), port))
+            .unwrap();
+        let page = render(&home(), &registry);
+        drop(server);
+
+        assert!(
+            page.contains(&format!(r#"href="/i/{name}""#)),
+            "a serving instance must link through the gateway prefix:\n{page}"
+        );
+        assert!(
+            !page.contains(&format!(r#"href="http://127.0.0.1:{port}""#)),
+            "the bare-port link is the bug this replaced:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_stopped_instance_is_not_a_link() {
+        // A port nothing is listening on must not be clickable: a link that
+        // leads to a connection error is worse than plain text.
+        let mut registry = Registry::default();
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        registry
+            .insert(
+                "stopped-one",
+                Instance::new(PathBuf::from("/tmp/stopped"), port),
+            )
+            .unwrap();
+        let page = render(&home(), &registry);
+
+        assert!(
+            !page.contains(r#"href="/i/stopped-one""#),
+            "a stopped instance must not link anywhere:\n{page}"
+        );
+        assert!(page.contains(&port.to_string()));
     }
 
     #[test]
