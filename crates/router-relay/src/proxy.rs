@@ -43,7 +43,28 @@ const HOP_BY_HOP: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     /// Loopback upstream, e.g. `http://127.0.0.1:3081`.
+    ///
+    /// Used for every request that no route in [`Self::routes`] claims.
     pub upstream: String,
+    /// Path-prefix routes, longest prefix first.
+    ///
+    /// # Why one origin matters
+    ///
+    /// The harness authenticates its API gateway with a cookie whose *name* is
+    /// derived from the request authority — `host:port`. A page served from
+    /// `127.0.0.1:3082` calling `127.0.0.1:3080` is therefore a different origin
+    /// in both senses the browser cares about: the request is blocked as
+    /// cross-origin, and the cookie would not be sent even if it were allowed.
+    /// The user sees "failed to fetch gateway", which names the symptom and not
+    /// the cause.
+    ///
+    /// Serving every instance through one origin removes the problem entirely:
+    /// the browser sees one authority, sends one cookie, and never performs a
+    /// cross-origin request. To the harness each request still arrives on its
+    /// own loopback port with its own authority, because the proxy connects to
+    /// the real upstream and the harness sees `127.0.0.1:<its port>` — so the
+    /// cookie it mints matches the authority it is asked for.
+    pub routes: Vec<Route>,
     /// How long to wait for the upstream to accept a connection.
     pub connect_timeout: Duration,
     /// How long to wait for response headers.
@@ -54,14 +75,78 @@ pub struct RelayConfig {
     pub max_buffered_body: usize,
 }
 
+/// One path prefix and the instance it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// Path prefix, without a trailing slash, e.g. `/i/main`.
+    pub prefix: String,
+    /// Loopback upstream for that prefix, e.g. `http://127.0.0.1:3082`.
+    pub upstream: String,
+}
+
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             upstream: "http://127.0.0.1:3081".to_string(),
+            routes: Vec::new(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(120),
             max_buffered_body: 8 * 1024 * 1024,
         }
+    }
+}
+
+impl RelayConfig {
+    /// The upstream that should serve a request path, and the path to send it.
+    ///
+    /// Returns `(upstream, rewritten_path)`. The prefix is stripped, because the
+    /// harness serves its app at `/` and knows nothing about being mounted under
+    /// a sub-path — so `/i/main/api/remote.mux` must reach it as
+    /// `/api/remote.mux`, or every asset and endpoint would 404.
+    ///
+    /// The longest matching prefix wins, so `/i/main-2` cannot be captured by a
+    /// route for `/i/main`.
+    #[must_use]
+    pub fn resolve(&self, path: &str) -> (&str, String, String) {
+        let mut best: Option<&Route> = None;
+        for route in &self.routes {
+            if !path_matches(&route.prefix, path) {
+                continue;
+            }
+            if best.is_none_or(|b| route.prefix.len() > b.prefix.len()) {
+                best = Some(route);
+            }
+        }
+        match best {
+            Some(route) => {
+                let rest = &path[route.prefix.len()..];
+                // A bare prefix means the instance root, not an empty path.
+                let rewritten = if rest.is_empty() {
+                    "/".to_string()
+                } else {
+                    rest.to_string()
+                };
+                (route.upstream.as_str(), rewritten, route.prefix.clone())
+            }
+            None => (self.upstream.as_str(), path.to_string(), String::new()),
+        }
+    }
+}
+
+/// Whether a path falls under a prefix.
+///
+/// Matched on a segment boundary: `/i/main` matches `/i/main` and
+/// `/i/main/api`, but never `/i/maintenance`. A plain `starts_with` would take
+/// the wrong instance for a name that happens to share a prefix — and the
+/// failure would look like one instance serving another's data.
+#[must_use]
+fn path_matches(prefix: &str, path: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -86,21 +171,17 @@ impl RelayState {
         &self.config.upstream
     }
 
-    /// The upstream host and port.
-    fn upstream_authority(&self) -> Result<(String, u16), ProxyError> {
-        let rest = self
-            .config
-            .upstream
-            .strip_prefix("http://")
-            .ok_or_else(|| {
-                ProxyError::new(
-                    ErrorCode::ConfigInvalid,
-                    format!(
-                        "upstream must be an http:// URL, got '{}'",
-                        self.config.upstream
-                    ),
-                )
-            })?;
+    /// The host and port of an upstream URL.
+    ///
+    /// Takes the URL rather than reading it from config, because a request may
+    /// be routed to any instance the relay knows about, not only the default.
+    fn authority_of(upstream: &str) -> Result<(String, u16), ProxyError> {
+        let rest = upstream.strip_prefix("http://").ok_or_else(|| {
+            ProxyError::new(
+                ErrorCode::ConfigInvalid,
+                format!("upstream must be an http:// URL, got '{upstream}'"),
+            )
+        })?;
         let rest = rest.trim_end_matches('/');
         match rest.split_once(':') {
             Some((host, port)) => {
@@ -230,7 +311,18 @@ async fn forward(
     state: &RelayState,
     req: Request<axum::body::Body>,
 ) -> Result<Response<RelayBody>, ProxyError> {
-    let (host, port) = state.upstream_authority()?;
+    // Which instance serves this path, and what path to ask it for.
+    //
+    // Resolved here rather than deeper down so that the WebSocket path and the
+    // ordinary path cannot disagree: both branches below use the same target.
+    let incoming = req
+        .uri()
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str)
+        .to_string();
+    let request_path = incoming.split('?').next().unwrap_or("/");
+    let (upstream, upstream_path, route_prefix) = state.config.resolve(request_path);
+    let (host, port) = RelayState::authority_of(upstream)?;
 
     let is_upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| {
         v.to_str()
@@ -274,10 +366,10 @@ async fn forward(
     });
 
     if is_upgrade {
-        return forward_upgrade(state, req, sender, conn_task).await;
+        return forward_upgrade(state, req, sender, conn_task, &upstream_path).await;
     }
 
-    forward_http(state, req, sender, conn_task).await
+    forward_http(state, req, sender, conn_task, &upstream_path, &route_prefix).await
 }
 
 /// Forward an ordinary HTTP request and stream the response back.
@@ -286,15 +378,21 @@ async fn forward_http(
     req: Request<axum::body::Body>,
     mut sender: http1::SendRequest<axum::body::Body>,
     conn_task: tokio::task::JoinHandle<()>,
+    upstream_path: &str,
+    prefix: &str,
 ) -> Result<Response<RelayBody>, ProxyError> {
     let (parts, body) = req.into_parts();
 
-    let mut builder = Request::builder().method(parts.method.clone()).uri(
-        parts
-            .uri
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str),
-    );
+    // The rewritten path, with the browser-side prefix removed.
+    //
+    // The harness serves its app at `/` and knows nothing about being mounted
+    // under a sub-path, so `/i/main/api/remote.mux` must reach it as
+    // `/api/remote.mux`. Passing the prefixed path through would 404 every
+    // asset and endpoint.
+    let query = parts.uri.query().map_or(String::new(), |q| format!("?{q}"));
+    let target = format!("{upstream_path}{query}");
+
+    let mut builder = Request::builder().method(parts.method.clone()).uri(target);
 
     // Headers pass through verbatim. Rewriting Host would break the browser
     // trust fence, because Origin would no longer match.
@@ -338,11 +436,63 @@ async fn forward_http(
     *out.status_mut() = parts.status;
     *out.headers_mut() = filter_headers(&parts.headers);
 
+    // Re-attach the browser-side prefix to any redirect.
+    //
+    // # Why this is required, not a nicety
+    //
+    // The harness authenticates by redirecting: it accepts `?token=…`, mints the
+    // cookie, and answers `303 Location: /`. That `Location` is *root-relative*,
+    // so the browser resolves it against the origin it is talking to — the
+    // gateway — and lands on `/`, which is the control page rather than the
+    // instance. The user sees the control page after logging in and concludes
+    // the login failed.
+    //
+    // Rewriting to `/i/<name>/` keeps the browser inside the instance. Without
+    // this the whole single-origin scheme breaks at the first redirect, which
+    // happens to be the login itself.
+    if let Some(location) = out.headers().get(header::LOCATION).cloned() {
+        if let Ok(value) = location.to_str() {
+            if let Some(rewritten) = reattach_prefix(value, prefix) {
+                if let Ok(header_value) = HeaderValue::from_str(&rewritten) {
+                    out.headers_mut().insert(header::LOCATION, header_value);
+                }
+            }
+        }
+    }
+
     // Tie the upstream connection to the response body: dropping the body must
     // release the connection rather than leaking it.
     let _guard = resp_task;
 
     Ok(out)
+}
+
+/// Prefix a root-relative redirect so it stays inside the instance.
+///
+/// Only root-relative targets are touched:
+///
+/// - `/api/x` becomes `/i/main/api/x` — it must stay on this instance.
+/// - `http://other/` and `//other/` are left alone: rewriting an absolute
+///   location would hijack a redirect the harness meant to send elsewhere.
+/// - `api/x` (relative to the current directory) needs no change; the browser
+///   resolves it against the request path, which already carries the prefix.
+///
+/// Returns `None` when nothing should change, so the caller can leave the
+/// header untouched rather than replacing it with an identical value.
+#[must_use]
+fn reattach_prefix(location: &str, prefix: &str) -> Option<String> {
+    // Already inside the instance: a second rewrite would double the prefix.
+    if location.starts_with(prefix) {
+        return None;
+    }
+    // Root-relative, and not protocol-relative (`//host/path`).
+    if !location.starts_with('/') || location.starts_with("//") {
+        return None;
+    }
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}{location}"))
 }
 
 /// `StreamBody` requires `Result<Frame<Bytes>, E>`; hyper's data stream yields
@@ -394,17 +544,19 @@ async fn forward_upgrade(
     req: Request<axum::body::Body>,
     sender: http1::SendRequest<axum::body::Body>,
     _conn_task: tokio::task::JoinHandle<()>,
+    upstream_path: &str,
 ) -> Result<Response<RelayBody>, ProxyError> {
     use hyper::upgrade::on as on_upgrade;
 
     let (parts, _body) = req.into_parts();
 
-    let mut builder = Request::builder().method(parts.method.clone()).uri(
-        parts
-            .uri
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str),
-    );
+    // The rewritten path, with the browser-side prefix removed — the same rule
+    // as the ordinary branch. The gateway socket lives at `/api/remote.mux`, so
+    // a prefixed path would never reach it.
+    let query = parts.uri.query().map_or(String::new(), |q| format!("?{q}"));
+    let target = format!("{upstream_path}{query}");
+
+    let mut builder = Request::builder().method(parts.method.clone()).uri(target);
 
     {
         let headers = builder.headers_mut().ok_or_else(|| {
@@ -454,6 +606,10 @@ async fn forward_upgrade(
 
     // Both sides are now raw streams. Splice them.
     //
+    // The handshake headers are read before the response is consumed below,
+    // because `on_upgrade` takes ownership of it.
+    let response_headers = resp.headers().clone();
+
     // `OnUpgrade::on` takes the message that carried the upgrade — here, the
     // 101 response from the upstream. The browser side takes it from the
     // request extensions, which is where hyper puts it.
@@ -478,8 +634,20 @@ async fn forward_upgrade(
     }
 
     // Reply 101 to the browser with the upstream's handshake headers.
+    //
+    // A bare `101` is not a valid handshake. The browser validates
+    // `Upgrade: websocket`, `Connection: Upgrade`, and — decisively — the
+    // `Sec-WebSocket-Accept` derived from the key it sent. Without them the
+    // socket error handler fires and the harness UI reports that it could not
+    // reach the gateway, while the network tab shows a perfectly good 101: the
+    // exchange looked successful and the client still refused it.
+    //
+    // These are copied deliberately, even though `Upgrade` and `Connection` are
+    // hop-by-hop and were filtered out of the request. For a 101 the handshake
+    // headers *are* the message, so passing them through is the whole point.
     let mut out = Response::new(full_body(Bytes::new()));
     *out.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    *out.headers_mut() = handshake_headers(&response_headers);
     Ok(out)
 }
 
@@ -493,6 +661,37 @@ pub fn relay_liveness_body(upstream: &str) -> String {
         "{{\"relay\":\"ok\",\"upstream\":\"{}\"}}",
         upstream.replace('"', "")
     )
+}
+
+/// Copy the handshake headers from an upstream `101` onto our reply.
+///
+/// A `101` is not "a response with a status code" — it *is* the handshake, and
+/// the client validates it field by field. Most importantly
+/// `Sec-WebSocket-Accept` is computed from the `Sec-WebSocket-Key` the client
+/// sent; a proxy that omits it produces a reply the client silently rejects,
+/// which surfaces to the user as "failed to fetch gateway" even though the
+/// network tab shows a successful 101.
+///
+/// `Upgrade` and `Connection` are normally hop-by-hop and are stripped from both
+/// directions by [`filter_headers`]. The `101` is the documented exception: the
+/// headers that describe this one hop's protocol change are exactly what must
+/// cross it.
+#[must_use]
+pub fn handshake_headers(upstream: &HeaderMap) -> HeaderMap {
+    const HANDSHAKE: &[HeaderName] = &[
+        header::UPGRADE,
+        header::CONNECTION,
+        header::SEC_WEBSOCKET_ACCEPT,
+        header::SEC_WEBSOCKET_PROTOCOL,
+        header::SEC_WEBSOCKET_EXTENSIONS,
+    ];
+    let mut out = HeaderMap::new();
+    for name in HANDSHAKE {
+        for value in upstream.get_all(name) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
 }
 
 /// Reject a method the relay does not forward.
@@ -520,6 +719,60 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn a_handshake_carries_accept_and_upgrade_headers() {
+        // The regression this guards: the relay used to answer the browser with
+        // a bare `101` and no headers. Every WebSocket then failed to open, so
+        // live agent output never arrived — while the network tab showed a
+        // perfectly healthy 101. `Sec-WebSocket-Accept` is the field the client
+        // actually validates, so it is the one that must survive.
+        let upstream = headers(&[
+            ("upgrade", "websocket"),
+            ("connection", "Upgrade"),
+            ("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            ("x-unrelated", "dropped"),
+        ]);
+        let out = handshake_headers(&upstream);
+        assert_eq!(out.get("upgrade").unwrap(), "websocket");
+        assert_eq!(out.get("connection").unwrap(), "Upgrade");
+        assert_eq!(
+            out.get("sec-websocket-accept").unwrap(),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+        // Only handshake fields travel; a 101 must not leak other upstream headers.
+        assert!(!out.contains_key("x-unrelated"));
+    }
+
+    #[test]
+    fn a_handshake_without_an_accept_header_is_empty_not_wrong() {
+        // If the upstream did not send one, inventing a value would be worse
+        // than sending none: the client would reject the exchange as invalid.
+        let out = handshake_headers(&headers(&[("content-type", "text/plain")]));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn repeated_handshake_headers_are_all_preserved() {
+        // `Sec-WebSocket-Protocol` and `Sec-WebSocket-Extensions` are list-valued
+        // and may legitimately arrive more than once.
+        let mut upstream = HeaderMap::new();
+        upstream.append(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("chat"),
+        );
+        upstream.append(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("superchat"),
+        );
+        let out = handshake_headers(&upstream);
+        let values: Vec<_> = out
+            .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["chat", "superchat"]);
     }
 
     #[test]
@@ -572,43 +825,165 @@ mod tests {
 
     #[test]
     fn upstream_authority_parses_host_and_port() {
-        let s = RelayState::new(RelayConfig::default());
-        let (host, port) = s.upstream_authority().unwrap();
+        let (host, port) = RelayState::authority_of("http://127.0.0.1:3081").unwrap();
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 3081);
     }
 
     #[test]
     fn upstream_authority_tolerates_trailing_slash() {
-        let s = RelayState::new(RelayConfig {
-            upstream: "http://127.0.0.1:9999/".into(),
-            ..RelayConfig::default()
-        });
-        let (host, port) = s.upstream_authority().unwrap();
+        let (host, port) = RelayState::authority_of("http://127.0.0.1:9999/").unwrap();
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 9999);
     }
 
     #[test]
     fn upstream_authority_rejects_non_http() {
-        let s = RelayState::new(RelayConfig {
-            upstream: "https://example.com".into(),
-            ..RelayConfig::default()
-        });
-        let e = s.upstream_authority().unwrap_err();
+        let e = RelayState::authority_of("https://example.com").unwrap_err();
         assert_eq!(e.code, ErrorCode::ConfigInvalid);
     }
 
     #[test]
     fn upstream_authority_rejects_bad_port() {
-        let s = RelayState::new(RelayConfig {
-            upstream: "http://127.0.0.1:not-a-port".into(),
-            ..RelayConfig::default()
-        });
         assert_eq!(
-            s.upstream_authority().unwrap_err().code,
+            RelayState::authority_of("http://127.0.0.1:not-a-port")
+                .unwrap_err()
+                .code,
             ErrorCode::ConfigInvalid
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Route resolution
+    //
+    // This is what makes several instances reachable from one browser origin,
+    // which is the only way the harness's per-authority auth cookie can work
+    // across them.
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn two_instances() -> RelayConfig {
+        RelayConfig {
+            upstream: "http://127.0.0.1:3081".into(),
+            routes: vec![
+                Route {
+                    prefix: "/i/main".into(),
+                    upstream: "http://127.0.0.1:3082".into(),
+                },
+                Route {
+                    prefix: "/i/notes".into(),
+                    upstream: "http://127.0.0.1:3083".into(),
+                },
+            ],
+            ..RelayConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_prefixed_path_routes_to_its_instance_and_strips_the_prefix() {
+        // The harness serves its app at `/` and knows nothing about being
+        // mounted under a sub-path, so the prefix must not be forwarded.
+        let cfg = two_instances();
+        let (upstream, path, _prefix) = cfg.resolve("/i/main/api/remote.mux");
+        assert_eq!(upstream, "http://127.0.0.1:3082");
+        assert_eq!(path, "/api/remote.mux");
+    }
+
+    #[test]
+    fn the_bare_prefix_means_the_instance_root() {
+        // `/i/main` on its own is the instance's home page, not an empty path.
+        let cfg = two_instances();
+        let (upstream, path, _prefix) = cfg.resolve("/i/main");
+        assert_eq!(upstream, "http://127.0.0.1:3082");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn each_route_goes_to_its_own_instance() {
+        let cfg = two_instances();
+        assert_eq!(cfg.resolve("/i/notes/x").0, "http://127.0.0.1:3083");
+        assert_eq!(cfg.resolve("/i/main/x").0, "http://127.0.0.1:3082");
+    }
+
+    #[test]
+    fn a_path_sharing_a_prefix_does_not_capture_another_instance() {
+        // `/i/maintenance` must not be served by `/i/main`. Getting this wrong
+        // would show one instance's data under another's URL, which is far
+        // worse than a 404.
+        let cfg = two_instances();
+        let (upstream, path, _prefix) = cfg.resolve("/i/maintenance/page");
+        assert_eq!(
+            upstream, "http://127.0.0.1:3081",
+            "an unmatched path falls through to the default upstream"
+        );
+        assert_eq!(path, "/i/maintenance/page");
+    }
+
+    #[test]
+    fn the_longest_matching_prefix_wins() {
+        // So a nested route can be added later without the shorter one
+        // shadowing it.
+        let cfg = RelayConfig {
+            routes: vec![
+                Route {
+                    prefix: "/i/app".into(),
+                    upstream: "http://127.0.0.1:4001".into(),
+                },
+                Route {
+                    prefix: "/i/app/deep".into(),
+                    upstream: "http://127.0.0.1:4002".into(),
+                },
+            ],
+            ..RelayConfig::default()
+        };
+        assert_eq!(cfg.resolve("/i/app/deep/x").0, "http://127.0.0.1:4002");
+        assert_eq!(cfg.resolve("/i/app/other").0, "http://127.0.0.1:4001");
+    }
+
+    #[test]
+    fn a_root_relative_redirect_keeps_the_instance_prefix() {
+        // The login flow: the harness accepts the token and answers
+        // `303 Location: /`. That is root-relative, so the browser would resolve
+        // it to the gateway's own root and land on the control page instead of
+        // the instance. This rewrite is what makes single-origin login work.
+        assert_eq!(
+            reattach_prefix("/", "/i/main"),
+            Some("/i/main/".to_string())
+        );
+        assert_eq!(
+            reattach_prefix("/api/sessions", "/i/main"),
+            Some("/i/main/api/sessions".to_string())
+        );
+    }
+
+    #[test]
+    fn an_absolute_redirect_is_left_alone() {
+        // Rewriting a location the harness meant to send elsewhere would hijack
+        // it, which is worse than a wrong-looking URL.
+        assert_eq!(reattach_prefix("http://example.com/x", "/i/main"), None);
+        assert_eq!(reattach_prefix("//example.com/x", "/i/main"), None);
+    }
+
+    #[test]
+    fn an_already_prefixed_redirect_is_not_prefixed_twice() {
+        // Reaching here would mean the harness echoed the prefix back; doubling
+        // it would produce `/i/main/i/main/` and a 404.
+        assert_eq!(reattach_prefix("/i/main/", "/i/main"), None);
+    }
+
+    #[test]
+    fn a_document_relative_redirect_needs_no_rewrite() {
+        // The browser resolves this against the request path, which already
+        // carries the prefix.
+        assert_eq!(reattach_prefix("settings", "/i/main"), None);
+    }
+
+    #[test]
+    fn an_unrouted_path_uses_the_default_upstream_unchanged() {
+        // Single-instance deployments keep working: no routes, no rewriting.
+        let cfg = RelayConfig::default();
+        let (upstream, path, _prefix) = cfg.resolve("/api/remote.mux");
+        assert_eq!(upstream, "http://127.0.0.1:3081");
+        assert_eq!(path, "/api/remote.mux");
     }
 
     #[test]

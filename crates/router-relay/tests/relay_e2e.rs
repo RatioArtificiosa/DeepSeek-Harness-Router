@@ -299,3 +299,131 @@ async fn strips_hop_by_hop_headers_end_to_end() {
         "hop-by-hop headers leaked: {resp}"
     );
 }
+
+/// Perform a raw HTTP/1.1 upgrade request and return the response head verbatim.
+///
+/// Returns everything up to the blank line that ends the head, so a caller can
+/// assert on the handshake fields without tripping over the raw tunnel bytes
+/// that follow.
+async fn raw_upgrade(addr: SocketAddr, path: &str, key: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+        .await
+        .expect("the relay did not answer the upgrade in time")
+        .unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    head.split("\r\n\r\n").next().unwrap_or("").to_string()
+}
+
+/// An upstream that completes a WebSocket handshake.
+///
+/// Sends the three fields every client validates, including a
+/// `Sec-WebSocket-Accept` derived from the key — the value a proxied handshake
+/// most easily loses and the one a client refuses the connection over.
+async fn spawn_upgrading_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 1024];
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // Echo the client's key into a syntactically valid accept value.
+                let key = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_default();
+                let resp = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: {key}-accept\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+                // Hold the socket open so the tunnel stays established.
+                let mut sink = vec![0u8; 64];
+                let _ = stream.read(&mut sink).await;
+            });
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+#[tokio::test]
+async fn an_upgrade_response_carries_the_handshake_headers() {
+    // The regression this guards: the relay used to clone the upstream `101`
+    // status but drop `Upgrade`, `Connection`, and `Sec-WebSocket-Accept`. The
+    // client therefore rejected its own successful handshake, and every live
+    // harness session died with a gateway error while the wire showed a 101.
+    let upstream = spawn_upgrading_upstream().await;
+    let relay = spawn_relay(upstream).await;
+
+    let head = raw_upgrade(relay, "/api/remote.mux", "dGhlIHNhbXBsZSBub25jZQ==").await;
+    let lower = head.to_ascii_lowercase();
+
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected a 101 handshake, got:\n{head}"
+    );
+    assert!(
+        lower.contains("upgrade: websocket"),
+        "the 101 must keep `Upgrade: websocket` or the client will not open the socket:\n{head}"
+    );
+    assert!(
+        lower.contains("connection: upgrade"),
+        "the 101 must keep `Connection: Upgrade`:\n{head}"
+    );
+    assert!(
+        lower.contains("sec-websocket-accept:"),
+        "the 101 must pass `Sec-WebSocket-Accept` through; it is the field the \
+         client actually validates:\n{head}"
+    );
+}
+
+#[tokio::test]
+async fn a_prefixed_upgrade_reaches_the_unprefixed_upstream_path() {
+    // The single-origin design depends on this: the browser connects to
+    // `/i/<name>/api/remote.mux`, and the harness only knows
+    // `/api/remote.mux`. If the prefix leaks through, the upstream 404s and the
+    // gateway never connects.
+    let upstream = spawn_upgrading_upstream().await;
+    let state = RelayState::new(RelayConfig {
+        upstream: format!("http://{upstream}"),
+        routes: vec![router_relay::Route {
+            prefix: "/i/main".to_string(),
+            upstream: format!("http://{upstream}"),
+        }],
+        ..RelayConfig::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, relay_router(state)).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let head = raw_upgrade(relay, "/i/main/api/remote.mux", "dGhlIHNhbXBsZSBub25jZQ==").await;
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "a prefixed upgrade should reach the upstream and hand back a 101:\n{head}"
+    );
+}
