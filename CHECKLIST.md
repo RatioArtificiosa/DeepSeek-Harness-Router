@@ -1,7 +1,7 @@
-# DeepSeek Router — Execution Checklist
+# DeepSeek Harness Router — Execution Checklist
 
-> **Companion to:** [`PROPOSAL.md`](./PROPOSAL.md) · **Version:** 1.0.0
-> **Repository:** <https://github.com/RatioArtificiosa/DeepSeek-Harness>
+> **Companion to:** [`PROPOSAL.md`](./PROPOSAL.md) · **Version:** 1.1.0
+> **Repository:** <https://github.com/RatioArtificiosa/DeepSeek-Harness-Router>
 
 ---
 
@@ -623,6 +623,312 @@ Every line is an explicit test with a pass criterion.
 | M4 | A new user reaches a session unaided | CT-05-12 |
 | M5 | DoD passes on all three platforms; docs truthful | CT-06-01 … CT-06-07, CT-06-18 |
 | M6 | The release gate is fully checked | CT-08-01 … CT-08-25 |
+
+---
+
+# PHASE CT-09 — Rust core (Repository, language, Docker-first)
+
+> **This phase runs in parallel with CT-02 onward.** It establishes the Router core in Rust and the Docker-first workflow.
+>
+> → §P-42 · §P-43
+
+## CT-09.A — Repository and workspace setup
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-09-01** Confirm all references point at `DeepSeek-Harness-Router`, not the superseded repo | → §P-41.2 |
+| `[ ]` | **CT-09-02** Set the repo-local git identity to the neutral, non-personal value | → §P-41.3 |
+| `[ ]` | **CT-09-03** Verify no commit metadata carries a personal name or email | → §P-41.3, §P-45.6 |
+| `[ ]` | **CT-09-04** Confirm `docs/research/` preserves the source conversation and both briefs | → §P-41.2 |
+| `[ ]` | **CT-09-05** Add a Cargo workspace root with `crates/` members | → §P-42.4 |
+| `[ ]` | **CT-09-06** Pin the Rust toolchain in `rust-toolchain.toml` to the version the container uses | → §P-42.7, §P-43.5 |
+| `[ ]` | **CT-09-07** Commit `Cargo.lock` and build with `--locked` | → §P-43.4 |
+
+## CT-09.B — Crate structure
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-09-08** `router-core` — supervision, health, config, path validation | → §P-42.4 |
+| `[ ]` | **CT-09-09** `router-relay` — HTTP/WebSocket/SSE loopback relay | → §P-42.4, §P-09 |
+| `[ ]` | **CT-09-10** `router-dsh` — the DSH adapter: SDK/JSON-RPC client, process supervision | → §P-42.3 |
+| `[ ]` | **CT-09-11** `router-cli` — the single static binary with subcommands (`serve`, `entrypoint`, `doctor`) | → §P-42.6 |
+| `[ ]` | **CT-09-12** Keep the DSH-facing code confined to `router-dsh` — the Rust equivalent of the adapter rule | → §P-16.3, §P-42.4 |
+
+## CT-09.C — Rust engineering standards
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-09-13** Use `tokio` for async; `axum`/`tower`/`hyper` for HTTP and WebSocket | → §P-42.7 |
+| `[ ]` | **CT-09-14** Use `serde`/`serde_json` for JSON-RPC and config | → §P-42.7 |
+| `[ ]` | **CT-09-15** Use `clap` (derive) for CLI parsing | → §P-42.7 |
+| `[ ]` | **CT-09-16** Use `thiserror` for typed errors; `anyhow` only at the binary boundary | → §P-42.7 |
+| `[ ]` | **CT-09-17** Use `tracing` + `tracing-subscriber` for structured JSON logs | → §P-42.7, §P-12.4 |
+| `[ ]` | **CT-09-18** Run `cargo fmt --check` and `cargo clippy -- -D warnings` in CI | → §P-42.7 |
+| `[ ]` | **CT-09-19** Confirm **no** commit lands with an unresolved rust-analyzer diagnostic | → §P-42.8 |
+
+## CT-09.D — Implement the SDK/JSON-RPC client
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-09-20** Implement newline-delimited JSON-RPC 2.0 framing over stdio | → §P-42.3 |
+| `[ ]` | **CT-09-21** Implement `initialize` and read `serverInfo` | → §P-42.3 |
+| `[ ]` | **CT-09-22** Implement `session/prompt` with the documented result shape | → §P-42.3 |
+| `[ ]` | **CT-09-23** Implement `shutdown` | → §P-42.3 |
+| `[ ]` | **CT-09-24** Handle the four server→client notifications: `session.event`, `session.status`, `subagent.started`, `subagent.finished` | → §P-42.3 |
+| `[ ]` | **CT-09-25** Map JSON-RPC errors (`-32601`, `-32603`) to typed Rust errors | → §P-42.3 |
+| `[ ]` | **CT-09-26** Test framing against a mock server, including malformed lines | → §P-42.7 |
+
+## CT-09.E — Port the core logic to Rust
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-09-27** Implement workspace path validation and the deny-list in Rust | → §P-10.4, §P-42.5 |
+| `[ ]` | **CT-09-28** Unit-test all seven Windows path hazards | → §P-10.3, §P-28.3 |
+| `[ ]` | **CT-09-29** Implement the relay (HTTP + WebSocket upgrade + SSE pass-through) | → §P-09.2 |
+| `[ ]` | **CT-09-30** Implement `/health`, `/health/live`, `/health/ready` | → §P-12.1, §P-12.3 |
+| `[ ]` | **CT-09-31** Implement readiness detection: readiness signal **plus** HTTP probe | → §P-11.4 |
+| `[ ]` | **CT-09-32** Implement process supervision with restart budget and backoff | → §P-11.2 |
+| `[ ]` | **CT-09-33** Implement the error-translation table | → §P-11.5 |
+| `[ ]` | **CT-09-34** Implement UID/GID privilege handling and the writability check | → §P-19.2 |
+
+## CT-09.F — Docker-first workflow
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-09-35** Add the `rust-builder` stage to the Dockerfile | → §P-43.4 |
+| `[ ]` | **CT-09-36** Build with `--release --locked --target x86_64-unknown-linux-musl` | → §P-43.4 |
+| `[ ]` | **CT-09-37** Use BuildKit cache mounts for the cargo registry and `target/` | → §P-43.4 |
+| `[ ]` | **CT-09-38** Copy **only** the resulting static binary into the runtime stage | → §P-43.4 |
+| `[ ]` | **CT-09-39** Create `docker/Dockerfile.dev` with the toolchain and test tooling | → §P-43.3 |
+| `[ ]` | **CT-09-40** Create `docker-compose.ci.yml` reproducing CI locally | → §P-43.3 |
+| `[ ]` | **CT-09-41** Verify `cargo check`, `cargo clippy`, `cargo test` all run **inside** the container | → §P-43.5 |
+| `[ ]` | **CT-09-42** Confirm the host toolchain is **not** required for a clean build | → §P-43.2 |
+| `[ ]` | **CT-09-43** Confirm the static binary runs on a bare `alpine` with no libc shims | → §P-42.5 |
+
+**Phase exit:** the Rust core builds in Docker, passes `clippy -D warnings` and its tests, drives DSH over SDK/JSON-RPC, and serves `/health` — with **no** host toolchain involvement.
+
+---
+
+# PHASE CT-10 — The premium README
+
+> The README is the product's public face. It is held to a higher standard than any other file.
+>
+> → §P-45
+
+## CT-10.A — Content
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-10-01** Write the one-paragraph promise in plain language | → §P-45.3 |
+| `[ ]` | **CT-10-02** Write "Why this exists" — the friction of installing DSH by hand | → §P-45.3 |
+| `[ ]` | **CT-10-03** Write the benefits section: outcome-led, five to six claims | → §P-45.3, §P-45.5 |
+| `[ ]` | **CT-10-04** Pair **every** feature with its benefit | → §P-45.3 |
+| `[ ]` | **CT-10-05** Write "What you can do" — concrete, benefit-framed capabilities | → §P-45.3 |
+| `[ ]` | **CT-10-06** Write "How it works" against the architecture diagram | → §P-45.3 |
+| `[ ]` | **CT-10-07** Write the security section making the trust boundary legible | → §P-45.3, §P-17.4 |
+| `[ ]` | **CT-10-08** Write the three installation flows, kept ruthlessly short | → §P-45.3, R-74 |
+| `[ ]` | **CT-10-09** Write the honest platform-support table | → §P-45.3, R-77 |
+| `[ ]` | **CT-10-10** Write the FAQ covering the objections a reader actually has | → §P-45.3 |
+| `[ ]` | **CT-10-11** Credit DeepSeek Harness and the ecosystem | → §P-45.3 |
+| `[ ]` | **CT-10-12** Route depth to `docs/` rather than bloating the README | → §P-45.7 |
+| `[ ]` | **CT-10-13** Read the whole README end-to-end applying the "would this make me scroll past?" test | → §P-45.5 |
+
+## CT-10.B — Visual assets
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-10-14** Create the hero banner (SVG, dark-first) | → §P-45.4 |
+| `[ ]` | **CT-10-15** Create the terminal capture showing the full startup experience | → §P-45.4 |
+| `[ ]` | **CT-10-16** Create the benefits grid (six outcomes, scannable) | → §P-45.4 |
+| `[ ]` | **CT-10-17** Create the architecture diagram | → §P-45.4 |
+| `[ ]` | **CT-10-18** Create the security-boundary diagram | → §P-45.4 |
+| `[ ]` | **CT-10-19** Create the install→run→work flow diagram | → §P-45.4 |
+| `[ ]` | **CT-10-20** Prefer SVG throughout for crispness and reviewability | → §P-45.4 |
+| `[ ]` | **CT-10-21** Verify every asset is legible at both GitHub desktop and mobile widths | → §P-45.4 |
+| `[ ]` | **CT-10-22** Confirm no stock photography is used | → §P-45.4 |
+
+## CT-10.C — Privacy (absolute)
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-10-23** Grep the entire repo for personal names, emails, and usernames | → §P-45.6 |
+| `[ ]` | **CT-10-24** Confirm no diagram or capture contains a real local path, drive letter, or hostname | → §P-45.6 |
+| `[ ]` | **CT-10-25** Confirm diagrams use only generic references (`/workspace`, `localhost`) | → §P-45.6 |
+| `[ ]` | **CT-10-26** Confirm no screenshot depicts real work or personal data | → §P-45.6 |
+| `[ ]` | **CT-10-27** Confirm commit metadata carries no identity | → §P-41.3, §P-45.6 |
+
+## CT-10.D — Accuracy under CI
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-10-28** Ensure the platform-support table matches what was actually tested | → §P-45.8, R-77 |
+| `[ ]` | **CT-10-29** Ensure every command in a code block is CI-executed or marked illustrative | → §P-45.8 |
+| `[ ]` | **CT-10-30** Add the dead-link check over the README | → §P-45.8 |
+| `[ ]` | **CT-10-31** Confirm no claim in the README exceeds the evidence | → §P-45.8 |
+| `[ ]` | **CT-10-32** Record the rule that diagrams are regenerated when the CLI output they depict changes | → §P-45.8 |
+
+**Phase exit:** the README reads as a landing page, every claim is reproducible, every image renders on desktop and mobile, and nothing about the author's environment appears anywhere.
+
+---
+
+# PHASE CT-11 — Private installer (NOT in the repository)
+
+> **Scheduling:** this phase begins **only after** the product is complete and validated in Docker.
+>
+> → §P-44
+
+## CT-11.A — Containment (verify first, build second)
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-11-01** Confirm `installer/` is ignored by `.gitignore` | → §P-44.3 |
+| `[ ]` | **CT-11-02** Confirm `installer/` is **not tracked**, with `git ls-files` | → §P-44.3 |
+| `[ ]` | **CT-11-03** Confirm `router-image.tar` and `*.local.*` are ignored | → §P-44.3 |
+| `[ ]` | **CT-11-04** Confirm no installer artifact appears in any commit on any branch | → §P-44.3 |
+
+## CT-11.B — Implementation
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-11-05** Implement OS/architecture/shell detection with a clear unsupported message | → §P-44.4 step 1 |
+| `[ ]` | **CT-11-06** Implement the Docker presence, daemon, and Compose v2 checks | → §P-44.4 steps 2–4 |
+| `[ ]` | **CT-11-07** Implement locate-or-clone of the repository | → §P-44.4 step 5 |
+| `[ ]` | **CT-11-08** Implement image build **or** `docker load` from the local archive | → §P-44.4 step 6, §P-44.5 |
+| `[ ]` | **CT-11-09** Implement workspace selection and validation | → §P-44.4 step 7 |
+| `[ ]` | **CT-11-10** Implement free-port selection | → §P-44.4 step 8 |
+| `[ ]` | **CT-11-11** Implement atomic `.env` generation | → §P-44.4 step 9 |
+| `[ ]` | **CT-11-12** Implement start-and-wait-for-health | → §P-44.4 step 10 |
+| `[ ]` | **CT-11-13** Implement best-effort browser opening with the URL always printed | → §P-44.4 step 11 |
+| `[ ]` | **CT-11-14** Register a desktop shortcut / launcher for future starts | → §P-44.4 step 12 |
+| `[ ]` | **CT-11-15** Provide a complete uninstall path | → §P-44.4 step 13 |
+
+## CT-11.C — Unattended reliability
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-11-16** Confirm every failure names the cause, names the fix, and exits non-zero | → §P-44.2, §P-44.8 criterion 2 |
+| `[ ]` | **CT-11-17** Confirm every step is idempotent — the installer is safe to re-run | → §P-44.7 |
+| `[ ]` | **CT-11-18** Confirm no step requires human interpretation of an error | → §P-44.2 |
+| `[ ]` | **CT-11-19** Confirm the installer never silently chooses a different workspace | → §P-44.6 |
+| `[ ]` | **CT-11-20** Confirm no half-installed state can persist | → §P-44.6 |
+| `[ ]` | **CT-11-21** Confirm the owner's existing DSH installation is untouched | → §P-44.6, §P-04.1 |
+| `[ ]` | **CT-11-22** Confirm no Docker resource outside our project is removed or pruned | → §P-44.6, §P-04.2 |
+| `[ ]` | **CT-11-23** Confirm no telemetry or network egress beyond the image source | → §P-44.6, §P-30.5 |
+
+## CT-11.D — Acceptance on the target machine
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-11-24** Run to completion unattended on a machine with only Docker installed | → §P-44.8 criterion 1 |
+| `[ ]` | **CT-11-25** Install from the local image archive with the network disabled | → §P-44.8 criterion 3 |
+| `[ ]` | **CT-11-26** Confirm the UI is reachable at the printed URL | → §P-44.8 criterion 4 |
+| `[ ]` | **CT-11-27** Run install → uninstall → install again with no manual cleanup | → §P-44.7, §P-44.8 criterion 6 |
+| `[ ]` | **CT-11-28** Write the private `README.local.md` so it runs months later without this conversation | → §P-44.8 criterion 8 |
+| `[ ]` | **CT-11-29** Re-verify the installer is absent from the public repository after all work | → §P-44.8 criterion 5 |
+
+**Phase exit:** the installer works unattended on the target machine, from a local archive, and is verifiably absent from the public repository.
+
+---
+
+# APPENDIX — Quick reference
+
+## A.1 Requirement → checklist phase
+
+| Requirement range | Meaning | Phases |
+|---|---|---|
+| R-01 … R-06 | Cross-platform, platform model | CT-01, CT-04, CT-06 |
+| R-07 … R-12 | Workspace model | CT-04.A, CT-04.D |
+| R-13, R-14 | Runtime filesystem | CT-04.D |
+| R-15, R-16 | Compose, no Kubernetes | CT-04.D |
+| R-17 … R-19 | Image | CT-02.A |
+| R-20 … R-25 | Launch scripts | CT-04.E, CT-04.F, CT-04.G |
+| R-26 … R-28 | Workspace selection | CT-04.A, CT-09.E |
+| R-29 … R-31 | Environment config | CT-04.C |
+| R-32 … R-36 | Health checks | CT-03.D, CT-09.E |
+| R-37, R-38 | Port handling | CT-04.B |
+| R-39 … R-41 | Browser launch | CT-04.E, CT-04.F |
+| R-42 … R-46 | Docker isolation | CT-04.D, CT-07.B |
+| R-47 … R-49 | Local development | CT-04.D, CT-09.F |
+| R-50 … R-52 | DSH installation | CT-02.A, CT-07.C |
+| R-53 … R-55 | Host DSH independence | CT-00, CT-06.B, CT-11.C |
+| R-56 … R-58 | Container architecture | CT-01, CT-02, CT-09.B |
+| R-59, R-60 | Path abstraction | CT-04.A, CT-09.E |
+| R-61 … R-64 | File permissions | CT-04.C, CT-07.C, CT-09.E |
+| R-65 … R-71 | Security | CT-07.A |
+| R-72, R-73 | CLI compatibility | CT-04.E, CT-04.F |
+| R-74 | README | CT-07.C, **CT-10.A** |
+| R-75, R-76 | CI | CT-06.C |
+| R-77 | No false claims | CT-06.C, CT-07.C, **CT-10.D** |
+| R-78 … R-80 | Future hosted | CT-07.B, CT-09.B |
+| R-81 | Definition of done | CT-04.H, CT-08 |
+
+## A.2 Risk → mitigation checklist
+
+| Risk | Mitigation checklist items |
+|---|---|
+| **RSK-01** Relay correctness | CT-03-06 … CT-03-21, **CT-09-29** |
+| **RSK-02** DSH won't run in container | CT-02-18 … CT-02-30 |
+| **RSK-03** Sandbox unavailable | CT-02-28, CT-03-24, CT-05-07 |
+| **RSK-04** Windows path corruption | CT-04-01 … CT-04-12, CT-09-27, CT-09-28 |
+| **RSK-05** Docker Desktop file sharing | CT-06-05, CT-06-06 |
+| **RSK-06** DSH version churn | CT-07-16, CT-07-22, CT-07-25, CT-09-12 |
+| **RSK-07** Image size/time | CT-02-30, CT-09-38 |
+| **RSK-08** Port collision | CT-04-13 … CT-04-19, CT-11-10 |
+| **RSK-09** Data loss on reset | CT-04-59, CT-04-60, CT-11-15 |
+| **RSK-10** UI scope creep | CT-05-01, CT-05-02 |
+| **RSK-11** Host DSH damaged | CT-00-08, CT-06-08, CT-06-12, CT-11-21 |
+| **RSK-12** Other workloads disturbed | CT-00-03 … CT-00-06, CT-06-09 … CT-06-11, CT-11-22 |
+| **RSK-13** Windows CI gap | CT-06-13 … CT-06-22 |
+| **RSK-14** `zstd` omission | CT-02-04, CT-02-20 |
+| **RSK-15** Corepack removed from Node | CT-02-08a, CT-02-08b |
+| **RSK-16** Landlock ABI < 8 leaves threads unrestricted | CT-02-28b, CT-02-28c |
+| **RSK-17** SBOM omits non-final stages | CT-02-08c, CT-07-14c |
+| **RSK-18** Docker socket added "for convenience" | CT-02-08e, CT-07-14a, CT-07-14b |
+| **RSK-19** Rust toolchain friction / build times | CT-09-06, CT-09-37, CT-09-42 |
+| **RSK-20** Private installer accidentally committed | CT-11-01 … CT-11-04, CT-11-29 |
+| **RSK-21** Personal or machine info leaks into the public repo | CT-09-03, CT-10-23 … CT-10-27 |
+
+## A.3 The watch-list risks
+
+- **RSK-06 (16)** — DSH version churn. Mitigation is architectural: all DSH-facing code confined to one adapter (**CT-09-12**).
+- **RSK-10 (16)** — UI scope creep. The only likely way this project fails non-technically. **CT-05-01** exists to be quoted.
+- **RSK-16 (15)** — the Landlock threading trap. Dangerous because it is **invisible**: a sandbox that reports success while sibling threads run unrestricted. **CT-02-28b/CT-02-28c** are the guard.
+- **RSK-01 / RSK-04 (15)** — the relay and Windows paths. Both front-loaded; both now have a **Rust implementation** with dedicated tests (CT-09-27 … CT-09-29).
+- **RSK-20 (new)** — the private installer leaking into the public repo. Mitigated by ignore rules **and** a verification item, because a single `git add -A` would publish it permanently.
+- **RSK-21 (new)** — personal or machine information in the public repo. Mitigated by a repo-local git identity and a grep-based privacy gate (**CT-10-23 … CT-10-27**).
+
+## A.4 Milestone exit criteria summary
+
+| Milestone | Exit criterion | Gate item |
+|---|---|---|
+| M0 | CI green on a correctly-structured repo | CT-01-17 |
+| M1 | `dsh --profile headless` runs in the container | CT-02-26 |
+| M2 | Real UI loads through the relay; streaming works | CT-03-19, CT-03-20 |
+| M3 | **The ten-step DoD passes and is recorded** | CT-04-61 … CT-04-73 |
+| M4 | A new user reaches a session unaided | CT-05-12 |
+| M5 | DoD passes on all three platforms; docs truthful | CT-06-01 … CT-06-07, CT-06-18 |
+| M6 | The release gate is fully checked | CT-08-01 … CT-08-25 |
+| **R** | **Rust core builds in Docker; relay and health verified** | **CT-09 exit** |
+| **D** | **README is premium, accurate, and privacy-clean** | **CT-10 exit** |
+| **I** | **Installer works unattended and is absent from the repo** | **CT-11 exit** |
+
+## A.5 The three new phases at a glance
+
+| Phase | Scope | Reference | When |
+|---|---|---|---|
+| **CT-09** | Rust core, crate structure, SDK client, Docker-first workflow | → §P-42, §P-43 | **Parallel with CT-02 onward** |
+| **CT-10** | The premium README, visual assets, privacy, accuracy | → §P-45 | After CT-04 (needs real output to depict) |
+| **CT-11** | The private installer | → §P-44 | **After the product is complete and validated in Docker** |
+
+## A.6 Sequencing rules introduced by Part VI
+
+| Rule | Reference |
+|---|---|
+| All Rust builds, tests, and linting happen **in Docker** — the host toolchain is never a requirement | → §P-43.2 |
+| Rust lands with **no unresolved rust-analyzer diagnostic** | → §P-42.8 |
+| Nothing lands in the repo that reveals personal or machine information | → §P-45.6 |
+| The installer is **never** committed — verified, not assumed | → §P-44.3 |
+| The installer is built **last**, once the product is proven | → §P-44.1 |
 
 ---
 

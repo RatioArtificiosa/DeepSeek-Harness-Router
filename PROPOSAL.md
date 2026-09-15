@@ -3226,6 +3226,9 @@ Scored: **Impact** (1–5) × **Likelihood** (1–5) = **Score**.
 | **RSK-16** | **Landlock ABI < 8 leaves sibling threads unrestricted** in a multi-threaded Node runtime, producing a control that *appears* to work | 5 | 3 | **15** | Runtime ABI query + TSYNC when available + fail closed below 8 for multi-threaded ops (S-02) | ABI probe reports < 8 |
 | **RSK-17** | **SBOM silently omits non-final stages**, understating the supply-chain surface | 3 | 4 | 12 | `BUILDKIT_SBOM_SCAN_STAGE=true` (§P-22.9) | — |
 | **RSK-18** | **A contributor adds the Docker socket "for convenience"** | 5 | 1 | 5 | Absolute prohibition with the CVE-2026-6406 rationale (§P-17.3 T-13) + CI assertion (S-31) | Any socket reference in a diff |
+| **RSK-19** | **Rust toolchain friction** — a second toolchain, slow builds, contributors unfamiliar with Rust | 3 | 3 | 9 | Toolchain pinned (§P-42.7); **all Rust builds in Docker** (§P-43); cache mounts (§P-43.4); the core is deliberately narrow (§P-42.4) | First cold build exceeds 10 min |
+| **RSK-20** | **The private installer is accidentally committed** to the public repository | 4 | 2 | 8 | `.gitignore` exclusion **plus** a verification item (CT-11-01 … CT-11-04, CT-11-29) | Any `installer/` path appears in `git status` as staged |
+| **RSK-21** | **Personal or machine information leaks** into the public repository | 4 | 3 | **12** | Repo-local neutral git identity (§P-41.3); privacy grep gate (§P-45.6); diagrams use only generic paths; checklist CT-10-23 … CT-10-27 | Any real path, name, or hostname found in a diff |
 
 ### §P-33.1 The risks that need active watching
 
@@ -3235,7 +3238,11 @@ Scored: **Impact** (1–5) × **Likelihood** (1–5) = **Score**.
 
 **RSK-16 (score 15) — the Landlock threading trap.** Newly surfaced by research and unusually dangerous because it is **invisible**: a single-threaded `restrict_self` in a multi-threaded Node process produces a sandbox that reports success while siblings run unrestricted. Prioritised because it is a *silent* security failure, and because the ABI on this machine (7) is **below** the TSYNC threshold (8) — so the failure mode is live here, not hypothetical.
 
-**RSK-01 / RSK-04 (score 15) — the relay and Windows paths.** Both are "write the test first" risks, front-loaded into M2/M3 so they surface early.
+**RSK-01 / RSK-04 (score 15) — the relay and Windows paths.** Both are "write the test first" risks, front-loaded into M2/M3 so they surface early. **The Rust decision (§P-42) materially de-risks both**: path handling becomes explicit and unit-testable, and the relay is implemented with a mature async stack rather than hand-rolled.
+
+**RSK-20 (score 8) — the private installer leaking into the repo.** Low likelihood, but the consequence is permanent: Git history is effectively immutable once pushed. Mitigated by ignore rules **and** an independent verification item, because belt-and-braces is the only sane posture for an irreversible mistake.
+
+**RSK-21 (score 12) — personal or machine information leaking.** The project owner explicitly required that no personal details appear anywhere. Mitigation is a **gate**, not a good intention: a neutral repo-local commit identity, a grep-based privacy check over the tree, and diagrams that reference only generic paths.
 
 ---
 
