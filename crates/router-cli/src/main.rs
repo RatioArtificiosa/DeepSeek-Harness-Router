@@ -1444,6 +1444,7 @@ fn gateway_url(direct: &str, name: &str, gateway_port: u16) -> Option<String> {
 }
 
 async fn cmd_logs(style: &Style, name: &str) -> Result<ExitCode, Failure> {
+    let quiet = style.verbosity == Verbosity::Quiet;
     let (home, registry) = load(None)?;
     if !registry.contains(name) {
         return Err(unknown_instance(name, &registry));
@@ -1457,11 +1458,26 @@ async fn cmd_logs(style: &Style, name: &str) -> Result<ExitCode, Failure> {
 
     let tail = supervisor.stderr_tail(name).await;
     if tail.is_empty() {
-        term::out(&style.dim(&format!("No output captured for {name} in this process.")));
-        term::out(&style.dim(&format!(
-            "  Its state lives at {}",
-            Registry::state_root(home.root(), name).display()
-        )));
+        // A running instance started by an *earlier* `router` invocation has no
+        // captured output here, because the capture belongs to the process that
+        // spawned it. Saying "no output" alone was true and unhelpful: the reader
+        // concludes the harness is silent rather than that this command cannot
+        // see it. Say which case it is, and where the state actually is.
+        let serving = serving_state(&home.instance_dir(name), instance.port);
+        if !quiet {
+            if serving == Serving::Ours {
+                term::out(&style.dim(&format!(
+                    "No output captured in this process — {name} was started by \
+                     another `router` invocation."
+                )));
+            } else {
+                term::out(&style.dim(&format!("No output captured for {name} in this process.")));
+            }
+            term::out(&style.dim(&format!(
+                "  Its state lives at {}",
+                Registry::state_root(home.root(), name).display()
+            )));
+        }
         return Ok(ExitCode::SUCCESS);
     }
     for line in tail {
