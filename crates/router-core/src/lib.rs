@@ -25,6 +25,7 @@ pub mod error;
 pub mod health;
 pub mod ports;
 pub mod registry;
+pub mod term;
 pub mod workspace;
 
 pub use config::Config;
@@ -32,6 +33,7 @@ pub use error::{ErrorCode, Result, RouterError};
 pub use health::{Check, HealthReport, Status};
 pub use ports::{allocate, AllocationOutcome, PortClaims};
 pub use registry::{Instance, Registry, DEFAULT_BASE_PORT, REGISTRY_VERSION};
+pub use term::{ColourMode, Glyphs, Ink, Style, Verbosity};
 pub use workspace::{validate_workspace, WorkspaceMode, WorkspacePath, WORKSPACE_MOUNT};
 
 /// The version of this build, from `Cargo.toml`.

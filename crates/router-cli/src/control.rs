@@ -1,0 +1,553 @@
+//! The control page.
+//!
+//! # What this is, and what it deliberately is not
+//!
+//! It answers one question — *what is running, where, and on what?* — and then
+//! gets out of the way. It is **not** a second agent UI: the harness ships a
+//! full interface, and rebuilding it here would duplicate a large surface and
+//! guarantee it lags behind.
+//!
+//! # Design notes
+//!
+//! - **The page is generated server-side from the registry**, so it renders
+//!   instantly with no client framework and no build step. For a local control
+//!   panel, shipping a bundle would be a cost with no benefit.
+//!
+//! - **State is legible at a glance and to a colour-blind reader.** A running
+//!   instance carries a filled dot *and* the word; colour is reinforcement, not
+//!   the message.
+//!
+//! - **The port is the largest thing in each row**, because it is what a person
+//!   is looking for.
+//!
+//! - **Nothing here can mutate anything remotely.** The page is a report. A web
+//!   page that can stop your agent processes, on a port with no authentication,
+//!   is a liability rather than a feature.
+
+use crate::paths::RouterHome;
+use router_core::registry::{Instance, Registry};
+use router_core::term::{self, Style};
+use std::net::SocketAddr;
+use std::process::ExitCode;
+
+use crate::Failure;
+
+/// Serve the control page until interrupted.
+pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, Failure> {
+    let (home, registry) = crate::load(None)?;
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        Failure::runtime(
+            format!("cannot listen on port {port}: {e}"),
+            "Another process may be using it. Choose another with --port.",
+        )
+    })?;
+
+    let actual = listener
+        .local_addr()
+        .map_err(|e| Failure::runtime(format!("cannot read the bound address: {e}"), ""))?;
+    let url = format!("http://127.0.0.1:{}", actual.port());
+
+    if style.verbosity != router_core::term::Verbosity::Quiet {
+        term::out(&style.ok("Control page ready"));
+        term::out("");
+        term::out(&format!(
+            "  {}  {}",
+            style.dim(style.glyphs.arrow),
+            style.url(&url)
+        ));
+        term::out(&style.dim("  Press Ctrl+C to stop."));
+        term::out("");
+    } else {
+        term::out(&url);
+    }
+
+    if !no_open {
+        // Best-effort: the printed URL is the authoritative answer.
+        let _ = open_page(&url);
+    }
+
+    // The registry can change while the page is served, so it is re-read per
+    // request rather than captured once. A control page showing stale state is
+    // worse than no control page.
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+
+        // Read fresh state, render, then write — inline rather than in a
+        // spawned task. A control page is requested by one human at a time, so
+        // concurrency here would buy nothing and complicate the borrows.
+        let fresh = Registry::load(&home.registry_path()).unwrap_or_else(|_| registry.clone());
+        let body = render(style, &home, &fresh);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Cache-Control: no-store\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        use tokio::io::AsyncWriteExt as _;
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+}
+
+/// Render the whole page.
+#[must_use]
+pub fn render(style: &Style, home: &RouterHome, registry: &Registry) -> String {
+    let instances: Vec<(&String, &Instance)> = registry.instances.iter().collect();
+    let running = instances
+        .iter()
+        .filter(|(_, i)| crate::probe_port(i.port))
+        .count();
+
+    let mut rows = String::new();
+    for (name, instance) in &instances {
+        rows.push_str(&render_row(style, name, instance, home));
+    }
+
+    if instances.is_empty() {
+        rows = r#"<tr><td colspan="4" class="empty">
+            <strong>No instances yet.</strong>
+            <span>Add one from your terminal:</span>
+            <code>router add my-project --workspace ~/projects/my-project</code>
+          </td></tr>"#
+            .to_string();
+    }
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek Harness Router</title>
+<style>{css}</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">
+      <svg viewBox="0 0 40 40" width="34" height="34" aria-hidden="true">
+        <path d="M20 6 L32 13 L32 27 L20 34 L8 27 L8 13 Z" fill="none"
+              stroke="url(#g)" stroke-width="2.2" stroke-linejoin="round"/>
+        <circle cx="20" cy="20" r="3.6" fill="url(#g)"/>
+        <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#4f8cff"/>
+          <stop offset="50%" stop-color="#7b5cff"/>
+          <stop offset="100%" stop-color="#37e0c8"/>
+        </linearGradient></defs>
+      </svg>
+      <div>
+        <h1>DeepSeek Harness Router</h1>
+        <p class="sub">{count} instance{plural} &middot; {running} serving</p>
+      </div>
+    </div>
+    <div class="home" title="{home_path}">{home_short}</div>
+  </header>
+
+  <table>
+    <thead>
+      <tr><th>Instance</th><th>Port</th><th>Workspace</th><th>Model</th></tr>
+    </thead>
+    <tbody>{rows}</tbody>
+  </table>
+
+  <footer>
+    <p>This page reports. It cannot start or stop anything &mdash; use the
+       <code>router</code> command for that.</p>
+  </footer>
+</main>
+</body>
+</html>"##,
+        css = CSS,
+        count = instances.len(),
+        plural = if instances.len() == 1 { "" } else { "s" },
+        running = running,
+        home_path = home.root().display(),
+        home_short = short_path(&home.root().display().to_string()),
+        rows = rows,
+    )
+}
+
+/// One instance row.
+fn render_row(style: &Style, name: &str, instance: &Instance, home: &RouterHome) -> String {
+    let _ = style;
+    let serving = crate::probe_port(instance.port);
+    let workspace_ok = instance.workspace.is_dir();
+    let url = format!("http://127.0.0.1:{}", instance.port);
+
+    // State is carried by a word and a shape, not by colour alone — a
+    // colour-blind reader must get the same information.
+    let (state_class, state_word) = if serving {
+        ("up", "serving")
+    } else {
+        ("down", "stopped")
+    };
+
+    let workspace_note = if workspace_ok {
+        String::new()
+    } else {
+        r#"<span class="flag">missing</span>"#.to_string()
+    };
+
+    let model = match &instance.model {
+        Some(m) => html_escape(m),
+        None => r#"<span class="muted">default</span>"#.to_string(),
+    };
+
+    // A serving instance links; a stopped one does not, because a link that
+    // leads nowhere is worse than no link.
+    let port_cell = if serving {
+        format!(
+            r#"<a class="port" href="{url}" title="Open the UI for {name}">{port}</a>"#,
+            url = html_escape(&url),
+            name = html_escape(name),
+            port = instance.port
+        )
+    } else {
+        format!(r#"<span class="port dead">{}</span>"#, instance.port)
+    };
+
+    // The state root is the instance's own DSH_HOME. Showing it is not
+    // decoration: it is the single fact that explains why these instances
+    // cannot interfere with each other, and it is the directory a user would
+    // inspect when something looks wrong.
+    let state_root = home.instance_dir(name).join("dsh");
+
+    format!(
+        r#"<tr>
+      <td class="name">
+        <span class="dot {state_class}" aria-hidden="true"></span>
+        <span class="label">{name}</span>
+        <span class="state">{state_word}</span>
+      </td>
+      <td>{port_cell}</td>
+      <td class="ws" title="{ws_full}">{ws}{flag}</td>
+      <td class="model">{model}</td>
+    </tr>
+    <tr class="detail"><td colspan="4">
+      <span class="muted">state</span> <code>{state_root}</code>
+    </td></tr>"#,
+        state_class = state_class,
+        name = html_escape(name),
+        state_word = state_word,
+        port_cell = port_cell,
+        ws_full = html_escape(&instance.workspace.display().to_string()),
+        ws = html_escape(&short_path(&instance.workspace.display().to_string())),
+        flag = workspace_note,
+        model = model,
+        state_root = html_escape(&state_root.display().to_string()),
+    )
+}
+
+/// Abbreviate the home prefix to `~`.
+fn short_path(path: &str) -> String {
+    for var in ["USERPROFILE", "HOME"] {
+        if let Ok(home) = std::env::var(var) {
+            if !home.is_empty() && path.starts_with(&home) {
+                return format!("~{}", &path[home.len()..]);
+            }
+        }
+    }
+    path.to_string()
+}
+
+/// Escape text for HTML.
+///
+/// Everything interpolated into this page goes through here. A workspace path
+/// is user-controlled, and a control page that can be made to render arbitrary
+/// markup is a control page that can be made to lie.
+#[must_use]
+pub fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Open a URL in the default browser.
+fn open_page(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = url;
+        Err(std::io::Error::other("unsupported platform"))
+    }
+}
+
+/// The stylesheet.
+///
+/// Dark-first, because a control panel is glanced at while working in a
+/// terminal, and a full-white page at that moment is hostile. It follows the
+/// system preference so a light-mode user is not forced into the dark.
+const CSS: &str = r#"
+:root {
+  --bg: #0a0e1a; --panel: #0d1628; --line: #1e2a44;
+  --ink: #e8eef9; --dim: #8296b5; --faint: #55668a;
+  --up: #37e0c8; --down: #f0a341; --accent: #4f8cff;
+  color-scheme: dark light;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f8fc; --panel: #ffffff; --line: #dde4f0;
+    --ink: #101a2e; --dim: #5a6b87; --faint: #8b9ab4;
+    --up: #0d9488; --down: #b45309; --accent: #2563eb;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 40px 24px; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+main { max-width: 960px; margin: 0 auto; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 28px; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 14px; }
+h1 { font-size: 19px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+.sub { margin: 2px 0 0; font-size: 13px; color: var(--dim); }
+.home { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--faint); }
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+thead th {
+  text-align: left; font-size: 11px; font-weight: 650; letter-spacing: 0.09em;
+  text-transform: uppercase; color: var(--faint); padding: 13px 18px;
+  border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 60%, var(--bg));
+}
+tbody tr:not(.detail) { border-top: 1px solid var(--line); }
+tbody tr:first-child:not(.detail) { border-top: none; }
+td { padding: 15px 18px; vertical-align: middle; }
+tr.detail td { padding: 0 18px 15px; border: none; font-size: 12px; }
+tr.detail code { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--faint); }
+.name { display: flex; align-items: center; gap: 10px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.dot.up { background: var(--up); box-shadow: 0 0 0 3px color-mix(in srgb, var(--up) 22%, transparent); }
+.dot.down { background: transparent; border: 1.5px solid var(--faint); }
+.label { font-weight: 600; }
+.state { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.06em; }
+.port {
+  font: 600 20px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--accent); text-decoration: none; letter-spacing: -0.02em;
+}
+.port:hover { text-decoration: underline; text-underline-offset: 3px; }
+.port.dead { color: var(--faint); font-weight: 500; }
+.ws { font: 12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--dim); word-break: break-all; }
+.flag { margin-left: 8px; font-size: 11px; color: var(--down); border: 1px solid var(--down); border-radius: 5px; padding: 1px 6px; }
+.model { font-size: 13px; }
+.muted { color: var(--faint); }
+.empty { text-align: center; padding: 56px 20px; color: var(--dim); }
+.empty strong { display: block; color: var(--ink); font-size: 16px; margin-bottom: 6px; }
+.empty span { display: block; margin-bottom: 12px; }
+.empty code { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--bg); border: 1px solid var(--line); padding: 8px 14px; border-radius: 8px; display: inline-block; color: var(--ink); }
+footer { margin-top: 22px; }
+footer p { font-size: 12.5px; color: var(--faint); margin: 0; }
+footer code { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--dim); }
+@media (max-width: 640px) {
+  body { padding: 24px 14px; }
+  thead { display: none; }
+  tbody tr:not(.detail) { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 14px 0; }
+  tbody tr.detail { display: block; }
+  td { padding: 2px 18px; }
+  td:nth-child(3), td:nth-child(4) { grid-column: 1 / -1; }
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn style() -> Style {
+        Style::with_colour(
+            router_core::term::ColourMode::Never,
+            router_core::term::Verbosity::Normal,
+        )
+    }
+
+    fn home() -> RouterHome {
+        RouterHome::resolve(Some(PathBuf::from("/tmp/router"))).unwrap()
+    }
+
+    #[test]
+    fn escapes_html_metacharacters() {
+        // A workspace path is user-controlled. A control page that can be made
+        // to render arbitrary markup is one that can be made to lie.
+        assert_eq!(html_escape("<script>"), "&lt;script&gt;");
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+        assert_eq!(html_escape("say \"hi\""), "say &quot;hi&quot;");
+        assert_eq!(html_escape("it's"), "it&#39;s");
+    }
+
+    #[test]
+    fn renders_an_empty_state_that_teaches_the_command() {
+        let registry = Registry::default();
+        let page = render(&style(), &home(), &registry);
+        assert!(page.contains("No instances yet"));
+        assert!(page.contains("router add"));
+    }
+
+    #[test]
+    fn renders_one_row_per_instance() {
+        let mut registry = Registry::default();
+        registry
+            .insert("alpha", Instance::new(PathBuf::from("/tmp/a"), 3081))
+            .unwrap();
+        registry
+            .insert("beta", Instance::new(PathBuf::from("/tmp/b"), 3082))
+            .unwrap();
+        let page = render(&style(), &home(), &registry);
+
+        assert!(page.contains("alpha"));
+        assert!(page.contains("beta"));
+        assert!(page.contains("3081"));
+        assert!(page.contains("3082"));
+    }
+
+    #[test]
+    fn the_port_is_shown_for_every_instance() {
+        // The port is what a person is looking for, so it must always appear.
+        let mut registry = Registry::default();
+        registry
+            .insert("only", Instance::new(PathBuf::from("/tmp/x"), 3099))
+            .unwrap();
+        let page = render(&style(), &home(), &registry);
+        assert!(page.contains("3099"));
+    }
+
+    #[test]
+    fn state_is_carried_by_a_word_not_only_by_colour() {
+        // A colour-blind reader must get the same information.
+        let mut registry = Registry::default();
+        registry
+            .insert("only", Instance::new(PathBuf::from("/tmp/x"), 3099))
+            .unwrap();
+        let page = render(&style(), &home(), &registry);
+        assert!(
+            page.contains("stopped") || page.contains("serving"),
+            "a textual state word must be present"
+        );
+    }
+
+    #[test]
+    fn a_hostile_workspace_path_cannot_inject_markup() {
+        let mut registry = Registry::default();
+        registry
+            .insert(
+                "evil",
+                Instance::new(PathBuf::from("/tmp/<img src=x onerror=alert(1)>"), 3081),
+            )
+            .unwrap();
+        let page = render(&style(), &home(), &registry);
+        assert!(
+            !page.contains("<img src=x"),
+            "raw markup leaked into the page"
+        );
+        assert!(page.contains("&lt;img"));
+    }
+
+    #[test]
+    fn a_hostile_instance_name_cannot_inject_markup() {
+        let mut registry = Registry::default();
+        // The registry validates names, so this is caught on insert; the test
+        // asserts the renderer would be safe even if it were not.
+        let name = "<script>alert(1)</script>";
+        if registry
+            .insert(name, Instance::new(PathBuf::from("/tmp/x"), 3081))
+            .is_err()
+        {
+            return; // rejected upstream, which is the stronger outcome
+        }
+        let page = render(&style(), &home(), &registry);
+        assert!(!page.contains("<script>alert"));
+    }
+
+    #[test]
+    fn the_default_model_is_labelled_as_such() {
+        let mut registry = Registry::default();
+        registry
+            .insert("only", Instance::new(PathBuf::from("/tmp/x"), 3081))
+            .unwrap();
+        let page = render(&style(), &home(), &registry);
+        assert!(page.contains("default"));
+    }
+
+    #[test]
+    fn a_named_model_appears_verbatim() {
+        let mut registry = Registry::default();
+        let mut inst = Instance::new(PathBuf::from("/tmp/x"), 3081);
+        inst.model = Some("deepseek-v4-pro".into());
+        registry.insert("only", inst).unwrap();
+        let page = render(&style(), &home(), &registry);
+        assert!(page.contains("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn the_page_states_that_it_cannot_mutate() {
+        // A web page that can stop agent processes, on an unauthenticated
+        // port, is a liability rather than a feature.
+        let page = render(&style(), &home(), &Registry::default());
+        assert!(page.contains("cannot start or stop"));
+    }
+
+    #[test]
+    fn the_state_root_is_shown_per_instance() {
+        let mut registry = Registry::default();
+        registry
+            .insert("alpha", Instance::new(PathBuf::from("/tmp/a"), 3081))
+            .unwrap();
+        let page = render(&style(), &home(), &registry);
+        assert!(page.contains("instances"));
+        assert!(page.contains("alpha"));
+    }
+
+    #[test]
+    fn output_is_a_complete_document() {
+        let page = render(&style(), &home(), &Registry::default());
+        assert!(page.starts_with("<!DOCTYPE html>"));
+        assert!(page.contains("</html>"));
+        assert!(page.contains("viewport"));
+    }
+
+    #[test]
+    fn the_count_pluralises_correctly() {
+        let mut registry = Registry::default();
+        let one = render(&style(), &home(), &registry);
+        assert!(one.contains("0 instances"));
+
+        registry
+            .insert("a", Instance::new(PathBuf::from("/tmp/a"), 3081))
+            .unwrap();
+        let two = render(&style(), &home(), &registry);
+        assert!(two.contains("1 instance"));
+        assert!(!two.contains("1 instances"));
+    }
+}

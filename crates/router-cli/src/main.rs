@@ -1,1 +1,1074 @@
-fn main() {}
+//! The `router` command.
+//!
+//! # Design intent
+//!
+//! This is the interface the product is judged by. Someone runs one command,
+//! reads the output, and decides whether this tool is any good. So the rules
+//! the rest of the codebase follows matter most here:
+//!
+//! - **The answer is the most visible thing.** Values are emphasised; labels
+//!   are not. The port, the workspace, and the URL are what a reader scans for.
+//!
+//! - **Every failure names a cause and a fix.** No bare errors.
+//!
+//! - **Nothing is printed that was not asked for.** No banner on every command.
+//!
+//! - **Output stays correct when piped.** Colour disappears; alignment does not.
+//!
+//! - **Exit codes mean something.** `0` succeeded; `1` failed; `2` is a usage
+//!   error, so a script can tell a typo from a runtime problem.
+
+use clap::{Parser, Subcommand};
+use router_core::registry::{is_valid_instance_name, Instance, Registry, DEFAULT_BASE_PORT};
+use router_core::term::{self, ColourMode, Ink, Style, Verbosity};
+use router_core::{allocate, validate_workspace, PortClaims, WorkspaceMode};
+use router_dsh::{InstanceSpec, MultiConfig, MultiSupervisor};
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+mod control;
+mod paths;
+
+use paths::RouterHome;
+
+/// Run several DeepSeek Harness instances on one machine.
+#[derive(Parser, Debug)]
+#[command(
+    name = "router",
+    version,
+    about = "Run several DeepSeek Harness instances on one machine",
+    long_about = "Run several DeepSeek Harness instances on one machine.\n\n\
+                  Each instance gets its own port, its own workspace, its own model, and \
+                  its own state directory, so they can be used in parallel without \
+                  interfering with each other or with a harness you already run.",
+    after_help = "EXAMPLES:\n  \
+                  router init\n  \
+                  router add api --workspace ~/projects/api\n  \
+                  router add notes --workspace ~/notes --model deepseek-v4-flash\n  \
+                  router list\n  \
+                  router open api",
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+
+    /// When to colourise output: auto, always, never.
+    #[arg(long, global = true, value_name = "WHEN")]
+    colour: Option<String>,
+
+    /// Print more detail.
+    #[arg(long, short, global = true)]
+    verbose: bool,
+
+    /// Print only the result.
+    #[arg(long, short, global = true, conflicts_with = "verbose")]
+    quiet: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Create the router home and an empty registry.
+    Init {
+        /// Override the router home location.
+        #[arg(long, value_name = "DIR")]
+        home: Option<PathBuf>,
+    },
+
+    /// Register and start a new instance.
+    Add {
+        /// A short name, used to address the instance.
+        name: String,
+
+        /// The project directory the agent works in.
+        #[arg(long, short, value_name = "DIR")]
+        workspace: PathBuf,
+
+        /// The model this instance should start on.
+        ///
+        /// Either a bare model id, or `provider/model` to name the route.
+        #[arg(long, short, value_name = "MODEL")]
+        model: Option<String>,
+
+        /// Share your existing harness credentials instead of a private copy.
+        #[arg(long)]
+        share_credentials: bool,
+
+        /// Register without starting.
+        #[arg(long)]
+        no_start: bool,
+    },
+
+    /// Show every instance and its state.
+    List {
+        /// Probe each instance's port to confirm it is really serving.
+        #[arg(long)]
+        probe: bool,
+    },
+
+    /// Start a stopped instance.
+    Start {
+        /// Which instance.
+        name: String,
+    },
+
+    /// Stop a running instance.
+    Stop {
+        /// Which instance.
+        name: String,
+
+        /// Stop every running instance.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Restart an instance.
+    Restart {
+        /// Which instance.
+        name: String,
+    },
+
+    /// Open an instance's UI in your browser.
+    Open {
+        /// Which instance.
+        name: String,
+    },
+
+    /// Show an instance's captured output.
+    Logs {
+        /// Which instance.
+        name: String,
+    },
+
+    /// Unregister an instance.
+    ///
+    /// Its workspace directory is never touched.
+    Rm {
+        /// Which instance.
+        name: String,
+
+        /// Do not ask for confirmation.
+        #[arg(long, short)]
+        yes: bool,
+    },
+
+    /// Summarise every instance; exits non-zero if any is down.
+    Status,
+
+    /// Check the environment and every instance. Changes nothing.
+    Doctor,
+
+    /// Serve a control page listing every instance.
+    Serve {
+        /// Port for the control page.
+        #[arg(long, default_value_t = 3090)]
+        port: u16,
+
+        /// Do not open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Print where the router keeps its files.
+    Home,
+}
+
+/// A runtime failure.
+const FAIL_EXIT: u8 = 1;
+/// A usage error, so a script can tell a typo from a failure.
+const USAGE_EXIT: u8 = 2;
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    let verbosity = if cli.quiet {
+        Verbosity::Quiet
+    } else if cli.verbose {
+        Verbosity::Verbose
+    } else {
+        Verbosity::Normal
+    };
+    let mode = ColourMode::from_env(cli.colour.as_deref());
+    let style = Style::with_colour(mode, verbosity);
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            term::err(&style.error(
+                &format!("cannot start the async runtime: {e}"),
+                "This is unexpected. Please report it with the command you ran.",
+            ));
+            return ExitCode::from(FAIL_EXIT);
+        }
+    };
+
+    match runtime.block_on(run(cli, &style)) {
+        Ok(code) => code,
+        Err(failure) => {
+            term::err(&style.error(&failure.message, &failure.remedy));
+            ExitCode::from(failure.exit)
+        }
+    }
+}
+
+/// A command failure, ready to print.
+struct Failure {
+    message: String,
+    remedy: String,
+    exit: u8,
+}
+
+impl Failure {
+    fn runtime(message: impl Into<String>, remedy: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            remedy: remedy.into(),
+            exit: FAIL_EXIT,
+        }
+    }
+
+    fn usage(message: impl Into<String>, remedy: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            remedy: remedy.into(),
+            exit: USAGE_EXIT,
+        }
+    }
+}
+
+/// Resolve the router home and load the registry.
+fn load(home_override: Option<PathBuf>) -> Result<(RouterHome, Registry), Failure> {
+    let home = RouterHome::resolve(home_override).map_err(|e| {
+        Failure::runtime(
+            e.detail.clone(),
+            "Set DSH_ROUTER_HOME to a writable directory.",
+        )
+    })?;
+    let registry = Registry::load(&home.registry_path()).map_err(|e| {
+        Failure::runtime(
+            e.detail.clone(),
+            "Fix or remove the registry file, then try again.",
+        )
+    })?;
+    Ok((home, registry))
+}
+
+async fn run(cli: Cli, style: &Style) -> Result<ExitCode, Failure> {
+    match cli.command {
+        Command::Init { home } => cmd_init(style, home),
+        Command::Add {
+            name,
+            workspace,
+            model,
+            share_credentials,
+            no_start,
+        } => cmd_add(style, name, workspace, model, share_credentials, no_start).await,
+        Command::List { probe } => cmd_list(style, probe),
+        Command::Start { name } => cmd_start(style, &name).await,
+        Command::Stop { name, all } => cmd_stop(style, &name, all).await,
+        Command::Restart { name } => cmd_restart(style, &name).await,
+        Command::Open { name } => cmd_open(style, &name),
+        Command::Logs { name } => cmd_logs(style, &name).await,
+        Command::Rm { name, yes } => cmd_rm(style, &name, yes),
+        Command::Status => cmd_status(style),
+        Command::Doctor => cmd_doctor(style).await,
+        Command::Serve { port, no_open } => control::serve(style, port, no_open).await,
+        Command::Home => {
+            let home = RouterHome::resolve(None).map_err(|e| {
+                Failure::runtime(
+                    e.detail.clone(),
+                    "Set DSH_ROUTER_HOME to a writable directory.",
+                )
+            })?;
+            term::out(&home.root().display().to_string());
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// init
+// ─────────────────────────────────────────────────────────────────────────
+
+fn cmd_init(style: &Style, home_override: Option<PathBuf>) -> Result<ExitCode, Failure> {
+    let home = RouterHome::resolve(home_override).map_err(|e| {
+        Failure::runtime(
+            e.detail.clone(),
+            "Set DSH_ROUTER_HOME to a writable directory.",
+        )
+    })?;
+
+    let existed = home.registry_path().exists();
+    let registry = Registry::default();
+    registry
+        .save(&home.registry_path())
+        .map_err(|e| Failure::runtime(e.detail.clone(), "Check that the directory is writable."))?;
+
+    if style.verbosity == Verbosity::Quiet {
+        term::out(&home.root().display().to_string());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if existed {
+        term::out(&style.info(&format!(
+            "Router home already initialised at {}",
+            style.strong(&home.root().display().to_string())
+        )));
+    } else {
+        term::out(&style.ok("Router home created"));
+    }
+    term::out(&style.field("home", &home.root().display().to_string()));
+    term::out(&style.field("registry", &home.registry_path().display().to_string()));
+    term::out(&style.field("first port", &DEFAULT_BASE_PORT.to_string()));
+    term::out("");
+    term::out(&style.dim("  Add your first instance:"));
+    term::out(&format!(
+        "    router add my-project --workspace {}",
+        style.paint(Ink::Blue, "~/projects/my-project")
+    ));
+
+    Ok(ExitCode::SUCCESS)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// add
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn cmd_add(
+    style: &Style,
+    name: String,
+    workspace: PathBuf,
+    model: Option<String>,
+    share_credentials: bool,
+    no_start: bool,
+) -> Result<ExitCode, Failure> {
+    if !is_valid_instance_name(&name) {
+        return Err(Failure::usage(
+            format!("'{name}' is not a valid instance name"),
+            "Use letters, digits, '-', '_' or '.', starting with a letter or digit.",
+        ));
+    }
+
+    let (home, mut registry) = load(None)?;
+
+    if registry.contains(&name) {
+        return Err(Failure::usage(
+            format!("an instance named '{name}' already exists"),
+            format!("Choose another name, or remove it first: router rm {name}"),
+        ));
+    }
+
+    // The workspace must be a real directory: the harness refuses to register a
+    // workspace over a path that does not exist, so discovering that here gives
+    // a better message than discovering it three layers down.
+    let validated = validate_workspace(&workspace.to_string_lossy(), WorkspaceMode::Existing)
+        .map_err(|e| {
+            Failure::usage(
+                e.detail.clone(),
+                e.remediation()
+                    .unwrap_or("Choose an existing project directory."),
+            )
+        })?;
+
+    // Two instances on one directory means two agents editing one tree. The
+    // harness will not stop that, so the router does.
+    if let Some((other, _)) = registry.find_by_workspace(validated.host()) {
+        return Err(Failure::usage(
+            format!(
+                "instance '{other}' already uses {}",
+                validated.host().display()
+            ),
+            "Two agents editing one project conflict. Use a different directory, \
+             or remove the other instance first.",
+        ));
+    }
+
+    let claims = PortClaims::from_ports(registry.claimed_ports());
+    let outcome = allocate(None, registry.base_port, &claims).map_err(|e| {
+        Failure::runtime(
+            e.detail.clone(),
+            e.remediation().unwrap_or("Free a port and try again."),
+        )
+    })?;
+
+    let mut instance = Instance::new(validated.host().to_path_buf(), outcome.port());
+    instance.model = model.clone();
+    instance.share_credentials = share_credentials;
+
+    registry
+        .insert(&name, instance)
+        .map_err(|e| Failure::usage(e.detail.clone(), "Choose a different name."))?;
+    registry.save(&home.registry_path()).map_err(|e| {
+        Failure::runtime(e.detail.clone(), "Check that the router home is writable.")
+    })?;
+
+    if style.verbosity != Verbosity::Quiet {
+        term::out(&style.ok(&format!("Registered {}", style.strong(&name))));
+        term::out(&style.field("workspace", &validated.host().display().to_string()));
+        term::out(&style.field("port", &outcome.port().to_string()));
+        if let Some(m) = &model {
+            term::out(&style.field("model", m));
+        }
+        term::out(
+            &style.field(
+                "state",
+                &Registry::state_root(home.root(), &name)
+                    .display()
+                    .to_string(),
+            ),
+        );
+    }
+
+    if no_start {
+        if style.verbosity != Verbosity::Quiet {
+            term::out("");
+            term::out(&style.dim(&format!("  Start it with:  router start {name}")));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    start_one(style, &home, &registry, &name).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// start / stop / restart
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn cmd_start(style: &Style, name: &str) -> Result<ExitCode, Failure> {
+    let (home, registry) = load(None)?;
+    if !registry.contains(name) {
+        return Err(unknown_instance(name, &registry));
+    }
+    start_one(style, &home, &registry, name).await
+}
+
+async fn start_one(
+    style: &Style,
+    home: &RouterHome,
+    registry: &Registry,
+    name: &str,
+) -> Result<ExitCode, Failure> {
+    let instance = registry
+        .get(name)
+        .ok_or_else(|| unknown_instance(name, registry))?;
+    let spec = InstanceSpec::from_registry(name, instance, home.root());
+
+    let supervisor = build_supervisor();
+    supervisor.register(spec).await;
+
+    if style.verbosity == Verbosity::Verbose {
+        term::out(&style.dim(&format!(
+            "  starting {name} on port {} with DSH_HOME={}",
+            instance.port,
+            Registry::state_root(home.root(), name).display()
+        )));
+    }
+
+    match supervisor.start(name).await {
+        Ok(report) => {
+            let url = format!("http://127.0.0.1:{}", instance.port);
+            if style.verbosity == Verbosity::Quiet {
+                term::out(&url);
+            } else {
+                term::out(&style.ok(&format!("{} is ready", style.strong(name))));
+                if report.settings_written {
+                    term::out(&style.info(&format!(
+                        "model set to {}",
+                        instance.model.as_deref().unwrap_or("the default")
+                    )));
+                }
+                term::out("");
+                term::out(&format!(
+                    "  {}  {}",
+                    style.dim(style.glyphs.arrow),
+                    style.url(&url)
+                ));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            let failure = e.to_failure();
+            let tail = supervisor.stderr_tail(name).await;
+            let hint = if tail.is_empty() {
+                format!("Run `router doctor`, then check: router logs {name}")
+            } else {
+                format!(
+                    "Last output:\n{}",
+                    tail.iter()
+                        .rev()
+                        .take(6)
+                        .rev()
+                        .map(|l| format!("    {l}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            Err(Failure::runtime(
+                format!("{name} failed to start: {}", failure.code),
+                format!("{}\n{hint}", failure.detail),
+            ))
+        }
+    }
+}
+
+async fn cmd_stop(style: &Style, name: &str, all: bool) -> Result<ExitCode, Failure> {
+    let (home, registry) = load(None)?;
+    let supervisor = build_supervisor();
+
+    if all {
+        for n in registry.names() {
+            let instance = registry.get(n).expect("name came from the registry");
+            supervisor
+                .register(InstanceSpec::from_registry(n, instance, home.root()))
+                .await;
+        }
+        let failures = supervisor.stop_all().await;
+        for (n, e) in &failures {
+            term::err(&style.warn(&format!("{n} did not stop cleanly: {e}")));
+        }
+        if failures.is_empty() {
+            if style.verbosity != Verbosity::Quiet {
+                term::out(&style.ok("All instances stopped"));
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        return Err(Failure::runtime(
+            format!("{} instance(s) did not stop", failures.len()),
+            "Check for orphaned processes with `router doctor`.",
+        ));
+    }
+
+    if !registry.contains(name) {
+        return Err(unknown_instance(name, &registry));
+    }
+    let instance = registry.get(name).expect("checked above");
+    supervisor
+        .register(InstanceSpec::from_registry(name, instance, home.root()))
+        .await;
+
+    supervisor.stop(name).await.map_err(|e| {
+        Failure::runtime(
+            e.to_string(),
+            "Check the process with `router doctor`.".to_string(),
+        )
+    })?;
+
+    if style.verbosity != Verbosity::Quiet {
+        term::out(&style.ok(&format!("Stopped {}", style.strong(name))));
+        term::out(&style.dim(&format!(
+            "  Port {} is remembered; `router start {name}` reclaims it.",
+            instance.port
+        )));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn cmd_restart(style: &Style, name: &str) -> Result<ExitCode, Failure> {
+    let (home, registry) = load(None)?;
+    if !registry.contains(name) {
+        return Err(unknown_instance(name, &registry));
+    }
+
+    let supervisor = build_supervisor();
+    let instance = registry.get(name).expect("checked above");
+    supervisor
+        .register(InstanceSpec::from_registry(name, instance, home.root()))
+        .await;
+
+    // Stopping an instance that is not running is not a failure.
+    let _ = supervisor.stop(name).await;
+
+    if style.verbosity != Verbosity::Quiet {
+        term::out(&style.dim(&format!("  Restarting {name}…")));
+    }
+    start_one(style, &home, &registry, name).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// list / status
+// ─────────────────────────────────────────────────────────────────────────
+
+fn cmd_list(style: &Style, probe: bool) -> Result<ExitCode, Failure> {
+    let (_home, registry) = load(None)?;
+
+    if registry.instances.is_empty() {
+        if style.verbosity != Verbosity::Quiet {
+            term::out(&style.dim("No instances yet."));
+            term::out("");
+            term::out(&format!(
+                "  Add one:  router add my-project --workspace {}",
+                style.paint(Ink::Blue, "~/projects/my-project")
+            ));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let rows: Vec<Vec<String>> = registry
+        .instances
+        .iter()
+        .map(|(name, instance)| {
+            // Without --probe the marker reflects registration, and the legend
+            // below says so, rather than implying a liveness check happened.
+            let marker = if probe {
+                if probe_port(instance.port) {
+                    style.paint(Ink::Green, style.glyphs.running)
+                } else {
+                    style.paint(Ink::Amber, style.glyphs.stopped)
+                }
+            } else {
+                style.paint(Ink::Dim, style.glyphs.bullet)
+            };
+            vec![
+                marker,
+                style.strong(name),
+                style.paint(Ink::Blue, &instance.port.to_string()),
+                compact_path(&instance.workspace),
+                instance
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| style.dim("default")),
+            ]
+        })
+        .collect();
+
+    term::out("");
+    // Only the two columns whose contents have no natural bound may shrink: a
+    // workspace path can be arbitrarily deep and a model name is user-supplied.
+    // The name, port, and status marker are short by construction and are left
+    // at full width — truncating a port would be a lie, not a summary.
+    term::out(&term::table_fitted(
+        style,
+        &["", "NAME", "PORT", "WORKSPACE", "MODEL"],
+        &rows,
+        &[(1, 26), (3, 46), (4, 28)],
+    ));
+
+    if !probe {
+        term::out("");
+        term::out(&style.dim(&format!(
+            "  {} registered. Add --probe to confirm each one is serving.",
+            style.glyphs.bullet
+        )));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_status(style: &Style) -> Result<ExitCode, Failure> {
+    let (_home, registry) = load(None)?;
+
+    if registry.instances.is_empty() {
+        term::out(&style.dim("No instances registered."));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut up = 0usize;
+    let mut down = 0usize;
+    for instance in registry.instances.values() {
+        if probe_port(instance.port) {
+            up += 1;
+        } else {
+            down += 1;
+        }
+    }
+
+    term::out(&format!(
+        "{} up  {}  {} down",
+        style.paint(Ink::Green, &up.to_string()),
+        style.glyphs.sep,
+        style.paint(
+            if down > 0 { Ink::Amber } else { Ink::Dim },
+            &down.to_string()
+        )
+    ));
+
+    // A non-zero exit when something is down, so a script can gate on it.
+    if down > 0 {
+        Ok(ExitCode::from(FAIL_EXIT))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// open / logs / rm
+// ─────────────────────────────────────────────────────────────────────────
+
+fn cmd_open(style: &Style, name: &str) -> Result<ExitCode, Failure> {
+    let (_home, registry) = load(None)?;
+    let instance = registry
+        .get(name)
+        .ok_or_else(|| unknown_instance(name, &registry))?;
+
+    let url = format!("http://127.0.0.1:{}", instance.port);
+
+    if !probe_port(instance.port) {
+        return Err(Failure::runtime(
+            format!("{name} is not serving on port {}", instance.port),
+            format!("Start it first: router start {name}"),
+        ));
+    }
+
+    match open_browser(&url) {
+        Ok(()) => {
+            if style.verbosity != Verbosity::Quiet {
+                term::out(&style.ok(&format!("Opened {}", style.url(&url))));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            // A failed browser handoff is not fatal: the URL is the answer.
+            term::err(&style.warn(&format!("could not open a browser: {e}")));
+            term::out(&style.url(&url));
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+async fn cmd_logs(style: &Style, name: &str) -> Result<ExitCode, Failure> {
+    let (home, registry) = load(None)?;
+    if !registry.contains(name) {
+        return Err(unknown_instance(name, &registry));
+    }
+
+    let supervisor = build_supervisor();
+    let instance = registry.get(name).expect("checked above");
+    supervisor
+        .register(InstanceSpec::from_registry(name, instance, home.root()))
+        .await;
+
+    let tail = supervisor.stderr_tail(name).await;
+    if tail.is_empty() {
+        term::out(&style.dim(&format!("No output captured for {name} in this process.")));
+        term::out(&style.dim(&format!(
+            "  Its state lives at {}",
+            Registry::state_root(home.root(), name).display()
+        )));
+        return Ok(ExitCode::SUCCESS);
+    }
+    for line in tail {
+        term::out(&line);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failure> {
+    let (home, mut registry) = load(None)?;
+    let instance = registry
+        .get(name)
+        .cloned()
+        .ok_or_else(|| unknown_instance(name, &registry))?;
+
+    if !yes {
+        // Say plainly what will and will not happen. The reassurance is the
+        // important half: people hesitate before a destructive-looking command,
+        // and rightly so.
+        term::out(&format!("  Remove instance {}?", style.strong(name)));
+        term::out(&style.dim(&format!(
+            "    Its workspace {} is NOT touched.",
+            instance.workspace.display()
+        )));
+        term::out(&style.dim(&format!(
+            "    Its state at {} is NOT deleted.",
+            Registry::state_root(home.root(), name).display()
+        )));
+        term::out("");
+        term::out(&style.dim("  Re-run with --yes to confirm."));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    registry.remove(name);
+    registry.save(&home.registry_path()).map_err(|e| {
+        Failure::runtime(e.detail.clone(), "Check that the router home is writable.")
+    })?;
+
+    if style.verbosity != Verbosity::Quiet {
+        term::out(&style.ok(&format!("Removed {}", style.strong(name))));
+        term::out(&style.dim(&format!(
+            "  Workspace left untouched at {}",
+            instance.workspace.display()
+        )));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// doctor
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn cmd_doctor(style: &Style) -> Result<ExitCode, Failure> {
+    term::out(&style.heading("DeepSeek Harness Router — diagnostics"));
+    term::out("");
+
+    let mut problems = 0usize;
+
+    match RouterHome::resolve(None) {
+        Ok(home) => {
+            if home.registry_path().exists() {
+                term::out(&style.ok(&format!("home          {}", home.root().display())));
+            } else {
+                term::out(&style.warn(&format!(
+                    "home          {} (not initialised)",
+                    home.root().display()
+                )));
+                term::out(&style.dim("              run `router init`"));
+                problems += 1;
+            }
+        }
+        Err(e) => {
+            term::out(&style.warn(&format!("home          unavailable: {}", e.detail)));
+            problems += 1;
+        }
+    }
+
+    let binary = std::env::var("DSH_BINARY").unwrap_or_else(|_| "dsh".to_string());
+    match which(&binary) {
+        Some(path) => {
+            let version = harness_version(&path).await;
+            term::out(&style.ok(&format!(
+                "harness       {}{}",
+                path.display(),
+                version.map_or(String::new(), |v| format!("  ({v})"))
+            )));
+        }
+        None => {
+            term::out(&style.warn(&format!("harness       '{binary}' not found on PATH")));
+            term::out(&style.dim("              install DeepSeek Harness, or set DSH_BINARY"));
+            problems += 1;
+        }
+    }
+
+    if probe_port(3080) {
+        term::out(&style.info("port 3080     in use (expected — the router starts at 3081)"));
+    } else {
+        term::out(&style.info("port 3080     free"));
+    }
+
+    let (_home, registry) = load(None)?;
+    if registry.instances.is_empty() {
+        term::out(&style.info("instances     none registered"));
+    } else {
+        term::out("");
+        term::out(&style.strong("  Instances"));
+        for (name, instance) in &registry.instances {
+            let live = probe_port(instance.port);
+            let workspace_ok = instance.workspace.is_dir();
+            let marker = if live {
+                style.paint(Ink::Green, style.glyphs.running)
+            } else {
+                style.paint(Ink::Dim, style.glyphs.stopped)
+            };
+            let state = if live { "serving" } else { "not serving" };
+            let state_text = if workspace_ok {
+                style.dim(state)
+            } else {
+                style.paint(Ink::Amber, &format!("{state} — workspace missing"))
+            };
+            term::out(&format!(
+                "    {marker} {}  :{}  {state_text}",
+                term::pad(name, 16),
+                instance.port
+            ));
+            if !workspace_ok {
+                problems += 1;
+            }
+        }
+    }
+
+    term::out("");
+    if problems == 0 {
+        term::out(&style.ok("Everything checks out"));
+        Ok(ExitCode::SUCCESS)
+    } else {
+        term::out(&style.warn(&format!("{problems} thing(s) need attention")));
+        Ok(ExitCode::from(FAIL_EXIT))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+fn build_supervisor() -> MultiSupervisor {
+    let binary = std::env::var("DSH_BINARY").unwrap_or_else(|_| "dsh".to_string());
+    MultiSupervisor::new(MultiConfig {
+        binary: PathBuf::from(binary),
+        ..MultiConfig::default()
+    })
+}
+
+fn unknown_instance(name: &str, registry: &Registry) -> Failure {
+    let known = registry.names();
+    let hint = if known.is_empty() {
+        "No instances are registered yet. Add one with: router add <name> --workspace <dir>"
+            .to_string()
+    } else {
+        format!("Registered instances: {}", known.join(", "))
+    };
+    Failure::usage(format!("no instance named '{name}'"), hint)
+}
+
+/// Whether something is listening on a loopback port.
+///
+/// A connection test, not a listing: the only reliable answer to "is it
+/// serving" is to ask it.
+fn probe_port(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// Shorten a path for display, without lying about where it is.
+///
+/// Only the home prefix is abbreviated, and only to `~`. A path shortened
+/// further would be a path the reader cannot act on.
+fn compact_path(path: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let home = PathBuf::from(home);
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// Locate an executable on PATH.
+fn which(name: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(name);
+    if candidate.is_absolute() && candidate.is_file() {
+        return Some(candidate);
+    }
+
+    let path = std::env::var_os("PATH")?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT".to_string())
+            .split(';')
+            .map(str::to_string)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+
+    for dir in std::env::split_paths(&path) {
+        for ext in &extensions {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Read the harness version, best-effort.
+async fn harness_version(binary: &std::path::Path) -> Option<String> {
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(binary)
+            .arg("--version")
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Open a URL in the platform's default browser.
+fn open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // `start` is a shell builtin, so it needs a shell. The empty first
+        // argument is the window title; without it a quoted URL would be
+        // consumed as the title.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = url;
+        Err(std::io::Error::other("unsupported platform"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_path_abbreviates_only_the_home_prefix() {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+        if let Some(home) = home {
+            let full = PathBuf::from(&home).join("projects").join("demo");
+            let short = compact_path(&full);
+            assert!(short.starts_with('~'), "got {short}");
+            assert!(short.contains("demo"), "the leaf must survive");
+        }
+    }
+
+    #[test]
+    fn unrelated_paths_are_shown_in_full() {
+        // Abbreviating a path we do not own would be a small lie.
+        let p = std::path::Path::new("/somewhere/else/entirely");
+        assert_eq!(compact_path(p), p.display().to_string());
+    }
+
+    #[test]
+    fn unknown_instance_lists_what_exists() {
+        let mut registry = Registry::default();
+        registry
+            .insert("alpha", Instance::new(PathBuf::from("/tmp/a"), 3081))
+            .unwrap();
+        let f = unknown_instance("beta", &registry);
+        assert!(f.message.contains("beta"));
+        assert!(f.remedy.contains("alpha"));
+    }
+
+    #[test]
+    fn unknown_instance_with_an_empty_registry_teaches_the_command() {
+        let f = unknown_instance("beta", &Registry::default());
+        assert!(f.remedy.contains("router add"));
+    }
+
+    #[test]
+    fn a_mistyped_name_is_a_usage_error_not_a_failure() {
+        // Exit 2 lets a script tell a typo from a runtime problem.
+        assert_eq!(unknown_instance("x", &Registry::default()).exit, USAGE_EXIT);
+        assert_ne!(unknown_instance("x", &Registry::default()).exit, FAIL_EXIT);
+    }
+
+    #[test]
+    fn probe_reports_a_listening_port() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(probe_port(port), "a bound port must probe as serving");
+    }
+
+    #[test]
+    fn probe_reports_nothing_on_an_unused_port() {
+        // Port 1 is reserved and refuses connections.
+        assert!(!probe_port(1));
+    }
+}
