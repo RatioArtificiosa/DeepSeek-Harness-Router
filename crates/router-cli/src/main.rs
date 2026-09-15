@@ -112,6 +112,16 @@ enum Command {
     Start {
         /// Which instance.
         name: String,
+
+        /// Open the browser interface once the instance is ready.
+        ///
+        /// Off by default: `start` is often run to bring an instance up for
+        /// something else, and a browser window appearing unprompted is an
+        /// interruption. But when the intent *is* to use the interface, copying
+        /// a URL out of the terminal — one carrying a login token that changes
+        /// on every start — is needless friction.
+        #[arg(long, short)]
+        open: bool,
     },
 
     /// Stop a running instance.
@@ -134,6 +144,10 @@ enum Command {
     Restart {
         /// Which instance.
         name: String,
+
+        /// Open the browser interface once the instance is ready again.
+        #[arg(long, short)]
+        open: bool,
     },
 
     /// Open an instance's UI in your browser.
@@ -390,9 +404,9 @@ async fn run(cli: Cli, style: &Style) -> Result<ExitCode, Failure> {
             no_share_credentials,
         } => cmd_edit(style, &name, model, share_credentials, no_share_credentials).await,
         Command::List { probe } => cmd_list(style, probe),
-        Command::Start { name } => cmd_start(style, &name).await,
+        Command::Start { name, open } => cmd_start(style, &name, open).await,
         Command::Stop { name, all } => cmd_stop(style, name.as_deref(), all).await,
-        Command::Restart { name } => cmd_restart(style, &name).await,
+        Command::Restart { name, open } => cmd_restart(style, &name, open).await,
         Command::Open { name } => cmd_open(style, &name),
         Command::Logs { name } => cmd_logs(style, &name).await,
         Command::Rm { name, yes } => cmd_rm(style, &name, yes).await,
@@ -637,19 +651,22 @@ async fn cmd_add(
     // the lock, and starting from a stale document would look up a state root
     // for an instance recorded with different values.
     let (_home, registry) = load(None)?;
-    start_one(style, &home, &registry, &name).await
+    // `add` does not take `--open`: the instance was just created and the user
+    // has not asked to look at it yet. `router start <name> --open` is the
+    // deliberate way to open one.
+    start_one(style, &home, &registry, &name, false).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // start / stop / restart
 // ─────────────────────────────────────────────────────────────────────────
 
-async fn cmd_start(style: &Style, name: &str) -> Result<ExitCode, Failure> {
+async fn cmd_start(style: &Style, name: &str, open: bool) -> Result<ExitCode, Failure> {
     let (home, registry) = load(None)?;
     if !registry.contains(name) {
         return Err(unknown_instance(name, &registry));
     }
-    start_one(style, &home, &registry, name).await
+    start_one(style, &home, &registry, name, open).await
 }
 
 async fn start_one(
@@ -657,6 +674,7 @@ async fn start_one(
     home: &RouterHome,
     registry: &Registry,
     name: &str,
+    open: bool,
 ) -> Result<ExitCode, Failure> {
     let instance = registry
         .get(name)
@@ -714,6 +732,48 @@ async fn start_one(
                     style.url(&url)
                 ));
             }
+
+            // `--open` launches the browser here, after readiness and with the
+            // authenticated URL in hand.
+            //
+            // The ordering is the whole point. Opening earlier would race the
+            // harness's own startup and land on a refused connection; opening
+            // with a port-only URL would land on "authentication required",
+            // because the login token is minted per process and exists only in
+            // the line we just captured.
+            //
+            // A browser that will not launch is not a failure: the URL is
+            // already printed above, and it is the authoritative answer.
+            if open {
+                match open_browser(&url) {
+                    Ok(()) => {
+                        // Say it opened. A command that silently launches a
+                        // window leaves the user unsure whether the terminal or
+                        // the browser is now in charge.
+                        if style.verbosity != Verbosity::Quiet {
+                            term::out("");
+                            term::out(&style.dim("  Opened in your browser."));
+                        }
+                    }
+                    Err(e) => {
+                        if style.verbosity != Verbosity::Quiet {
+                            term::out("");
+                            term::err(
+                                &style.warn(&format!(
+                                    "  could not open a browser automatically: {e}"
+                                )),
+                            );
+                            term::out(&style.dim("  Open the address above instead."));
+                        }
+                    }
+                }
+            } else if style.verbosity != Verbosity::Quiet {
+                // Tell the user the URL is a link, since the terminal is where
+                // they are looking and the token makes it un-typeable by hand.
+                term::out("");
+                term::out(&style.dim(&format!("  Open it with:  router open {name}")));
+            }
+
             Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
@@ -946,7 +1006,7 @@ fn stop_failure(name: &str, reason: &StopFailure, port: u16) -> Failure {
     )
 }
 
-async fn cmd_restart(style: &Style, name: &str) -> Result<ExitCode, Failure> {
+async fn cmd_restart(style: &Style, name: &str, open: bool) -> Result<ExitCode, Failure> {
     let (home, registry) = load(None)?;
     if !registry.contains(name) {
         return Err(unknown_instance(name, &registry));
@@ -964,7 +1024,7 @@ async fn cmd_restart(style: &Style, name: &str) -> Result<ExitCode, Failure> {
     if style.verbosity != Verbosity::Quiet {
         term::out(&style.dim(&format!("  Restarting {name}…")));
     }
-    start_one(style, &home, &registry, name).await
+    start_one(style, &home, &registry, name, open).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1831,20 +1891,38 @@ mod tests {
 
     #[test]
     fn probe_reports_a_real_http_server_as_serving() {
-        // The positive case: something that actually answers HTTP.
+        // The positive case: something that answers HTTP.
+        //
+        // # Why the mock serves in a loop
+        //
+        // The first version accepted exactly one connection and exited, which is
+        // flaky by construction: the probe opens a connection, and any stray
+        // connect consumes the single accept, leaving the real probe to time out.
+        // It failed about one run in five. A test that fails at random teaches
+        // you to ignore failures, so the mock now answers every connection.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             use std::io::Write as _;
-            if let Ok((mut conn, _)) = listener.accept() {
+            // Bounded, so a probe bug cannot hang the suite forever.
+            for _ in 0..16 {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    break;
+                };
                 let _ = conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = conn.flush();
             }
         });
+
         assert!(
             probe_port(port),
             "a responding HTTP server must probe as up"
         );
-        let _ = server.join();
+
+        // The thread is a daemon for practical purposes: it exits when its
+        // bounded loop finishes or the listener is released at process end, so
+        // joining it here would only add a wait for no benefit.
+        drop(server);
     }
 
     #[test]
