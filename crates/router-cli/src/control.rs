@@ -103,6 +103,96 @@ pub fn clear_gateway_port(home: &RouterHome) {
     let _ = std::fs::remove_file(gateway_port_path(home));
 }
 
+/// The cookie that remembers which instance this browser is using.
+///
+/// # Why a cookie, and why it is the only workable basis
+///
+/// The harness builds some of its own URLs from the origin rather than the
+/// current path — the live gateway socket at `/api/remote.mux` above all. Those
+/// requests arrive at the gateway naming no instance, and no response rewriting
+/// can help, because the URL is assembled in JavaScript at runtime.
+///
+/// The gateway must therefore infer the instance. A cookie is the honest way to
+/// do it: it is per-browser, so two tabs on two instances do not fight, and it is
+/// set at the one moment the user's intent is unambiguous — when they open
+/// `/i/<name>/`.
+///
+/// It is deliberately *not* `HttpOnly`-only with a secret: it carries no
+/// authority of its own, only a routing hint. The harness still authenticates
+/// every request with its own cookie, so a forged value can at most point a
+/// browser at an instance it could not otherwise reach — and the harness refuses
+/// that request anyway.
+const AFFINITY_COOKIE: &str = "dsr-instance";
+
+/// The instance named in an `/i/<name>...` path, if there is one.
+fn instance_from_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/i/")?;
+    let name = rest.split('/').next()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Whether a path is one the harness's UI requests from the origin root.
+///
+/// Deliberately a fixed list rather than "anything not /i/": the control page
+/// lives at `/`, and a catch-all would swallow a mistyped address and serve an
+/// instance instead of saying the path is wrong.
+fn is_harness_root_path(path: &str) -> bool {
+    const PREFIXES: [&str; 5] = [
+        "/api/",
+        "/plugins/",
+        "/assets/",
+        "/open-in-app/",
+        "/favicon",
+    ];
+    PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// Rewrite a bare harness request into the prefixed form the relay routes.
+fn prefix_request(req: axum::extract::Request, name: &str) -> axum::extract::Request {
+    let (mut parts, body) = req.into_parts();
+    let path = parts.uri.path();
+    let query = parts.uri.query().map_or(String::new(), |q| format!("?{q}"));
+    let target = format!("/i/{name}{path}{query}");
+    if let Ok(uri) = target.parse() {
+        parts.uri = uri;
+    }
+    axum::extract::Request::from_parts(parts, body)
+}
+
+/// The instance this browser is currently using, from its cookie.
+fn current_instance(req: &axum::extract::Request) -> Option<String> {
+    let cookies = req
+        .headers()
+        .get(axum::http::header::COOKIE)?
+        .to_str()
+        .ok()?;
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == AFFINITY_COOKIE && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Attach the affinity cookie to a response when the path names an instance.
+fn with_affinity_cookie(
+    mut response: axum::response::Response,
+    path: &str,
+) -> axum::response::Response {
+    let Some(name) = instance_from_path(path) else {
+        return response;
+    };
+    // Only the instance's own document sets affinity. Setting it on every asset
+    // request would be noise, and setting it on an API call would make a stray
+    // background request silently re-point the browser.
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+        "{AFFINITY_COOKIE}={name}; Path=/; SameSite=Lax"
+    )) {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, value);
+    }
+    response
+}
+
 /// Serve the control page and the instance gateway until interrupted.
 ///
 /// Two jobs on one port, and they belong together: the page is how a person
@@ -224,12 +314,52 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
                 if let Some(relay) = relay {
                     if path.starts_with("/i/") {
                         use tower::ServiceExt as _;
-                        return relay.oneshot(req).await.unwrap_or_else(|e| {
+                        let response = relay.clone().oneshot(req).await.unwrap_or_else(|e| {
                             axum::response::Response::builder()
                                 .status(axum::http::StatusCode::BAD_GATEWAY)
                                 .body(axum::body::Body::from(format!("relay failed: {e}")))
                                 .expect("a fixed response always builds")
                         });
+                        // Opening an instance marks this browser as using it, so
+                        // the app's origin-rooted requests can be routed back
+                        // here — see `AFFINITY_COOKIE`.
+                        return with_affinity_cookie(response, &path);
+                    }
+
+                    // A root-absolute harness path, sent by an app that is
+                    // already open on an instance.
+                    //
+                    // # Why this exists at all
+                    //
+                    // The harness serves its UI at `/` and builds some of its own
+                    // URLs from the *origin* rather than the current path — the
+                    // API calls and the live gateway socket, most importantly
+                    // `ws://host/api/remote.mux`. Through the gateway those
+                    // resolve to `/api/remote.mux`, which names no instance, so
+                    // they 404 and the app shows "Failed to load plugins" or
+                    // retries a dead socket forever.
+                    //
+                    // No amount of response rewriting fixes it: the URL is
+                    // constructed in JavaScript at runtime, not present in any
+                    // document the relay can edit. The gateway therefore has to
+                    // decide, and the only honest basis is *which instance this
+                    // browser is currently using* — recorded when it opened one.
+                    if is_harness_root_path(&path) {
+                        if let Some(name) = current_instance(&req) {
+                            use tower::ServiceExt as _;
+                            // Rewritten into the prefixed form the relay already
+                            // understands, so there is one routing rule rather
+                            // than two: `/api/x` becomes `/i/<name>/api/x`, and
+                            // the existing prefix handling carries it the rest of
+                            // the way — including the WebSocket upgrade.
+                            let rewritten = prefix_request(req, &name);
+                            return relay.oneshot(rewritten).await.unwrap_or_else(|e| {
+                                axum::response::Response::builder()
+                                    .status(axum::http::StatusCode::BAD_GATEWAY)
+                                    .body(axum::body::Body::from(format!("relay failed: {e}")))
+                                    .expect("a fixed response always builds")
+                            });
+                        }
                     }
                 }
 
@@ -932,6 +1062,98 @@ mod tests {
             "a stopped instance must not link anywhere:\n{page}"
         );
         assert!(page.contains(&port.to_string()));
+    }
+
+    #[test]
+    fn an_instance_name_is_read_from_the_path() {
+        assert_eq!(instance_from_path("/i/main").as_deref(), Some("main"));
+        assert_eq!(instance_from_path("/i/main/").as_deref(), Some("main"));
+        assert_eq!(
+            instance_from_path("/i/notes/api/x").as_deref(),
+            Some("notes")
+        );
+        // Not an instance path at all.
+        assert_eq!(instance_from_path("/"), None);
+        assert_eq!(instance_from_path("/api/x"), None);
+        // The prefix with nothing after it names nothing.
+        assert_eq!(instance_from_path("/i/"), None);
+    }
+
+    #[test]
+    fn only_harness_paths_are_routed_by_affinity() {
+        // The list is deliberately fixed. A catch-all would swallow a mistyped
+        // address and serve an instance instead of reporting the path wrong.
+        assert!(is_harness_root_path("/api/remote.mux"));
+        assert!(is_harness_root_path("/plugins/??a.js"));
+        assert!(is_harness_root_path("/assets/index.js"));
+        assert!(is_harness_root_path("/favicon.svg"));
+        assert!(is_harness_root_path("/open-in-app/apps"));
+
+        assert!(!is_harness_root_path("/"));
+        assert!(!is_harness_root_path("/i/main/"));
+        assert!(!is_harness_root_path("/typo"));
+        // A near-miss must not match: `/apis/` is not `/api/`.
+        assert!(!is_harness_root_path("/apis/x"));
+    }
+
+    #[test]
+    fn a_bare_path_is_rewritten_into_the_instance_prefix() {
+        let req = axum::extract::Request::builder()
+            .uri("/api/remote.mux?token=abc")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let out = prefix_request(req, "notes");
+        assert_eq!(out.uri().path(), "/i/notes/api/remote.mux");
+        // The query must survive: the harness token travels in it.
+        assert_eq!(out.uri().query(), Some("token=abc"));
+    }
+
+    #[test]
+    fn the_affinity_cookie_is_read_and_ignored_when_absent() {
+        let with = axum::extract::Request::builder()
+            .header("cookie", "other=1; dsr-instance=notes; more=2")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(current_instance(&with).as_deref(), Some("notes"));
+
+        let without = axum::extract::Request::builder()
+            .header("cookie", "other=1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(current_instance(&without), None);
+
+        let none = axum::extract::Request::builder()
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(current_instance(&none), None);
+    }
+
+    #[test]
+    fn opening_an_instance_sets_affinity_but_a_bare_path_does_not() {
+        // Setting it on every request would let a stray background call re-point
+        // the browser; only the instance's own document should do that.
+        let response = || {
+            axum::response::Response::builder()
+                .status(200)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let marked = with_affinity_cookie(response(), "/i/notes/");
+        let cookie = marked
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(cookie.contains("dsr-instance=notes"), "{cookie}");
+        assert!(cookie.contains("Path=/"), "{cookie}");
+
+        let untouched = with_affinity_cookie(response(), "/api/settings/describe");
+        assert!(untouched
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .is_none());
     }
 
     #[test]

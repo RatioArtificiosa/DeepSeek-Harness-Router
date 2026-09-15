@@ -396,11 +396,32 @@ async fn forward_http(
 
     // Headers pass through verbatim. Rewriting Host would break the browser
     // trust fence, because Origin would no longer match.
+    //
+    // One header is an exception, and it is load-bearing: `Accept-Encoding` is
+    // dropped for navigations that will be rewritten.
+    //
+    // # Why the compression has to go
+    //
+    // The harness compresses its HTML (`Vary: Accept-Encoding`). A compressed
+    // body cannot be rewritten as text — searching it for `href="` finds nothing,
+    // and any edit corrupts the stream — so the browser answers
+    // `ERR_CONTENT_DECODING_FAILED` and the page never renders. That is a worse
+    // failure than the 404s it replaced, because nothing loads at all.
+    //
+    // Declining the compression is the honest fix: the relay asks for what it can
+    // actually process. The cost is a few kilobytes of HTML on a loopback link,
+    // which is not worth a decompression dependency to avoid. A request that will
+    // not be rewritten keeps its `Accept-Encoding` and streams compressed as
+    // before.
+    let rewritable = wants_html_rewrite(&parts.headers);
     {
         let headers = builder.headers_mut().ok_or_else(|| {
             ProxyError::new(ErrorCode::RelayUpstreamUnreachable, "cannot build headers")
         })?;
         *headers = filter_headers(&parts.headers);
+        if rewritable {
+            headers.remove(header::ACCEPT_ENCODING);
+        }
     }
 
     let outbound = builder.body(body).map_err(|e| {
@@ -429,12 +450,67 @@ async fn forward_http(
     let resp_task = conn_task;
     let (parts, body) = resp.into_parts();
 
-    let stream = body.into_data_stream();
-    let mapped = StreamBody::new(futures_stream_map(stream));
+    // An HTML page is rewritten so the harness's root-absolute URLs stay inside
+    // the instance. Everything else streams untouched.
+    //
+    // # Why the harness cannot simply be asked to use relative URLs
+    //
+    // It does, for most things — the shell loads `./assets/index-*.js`. But two
+    // categories are root-absolute and cannot be made relative from the outside:
+    // the plugin bundle (`/plugins/??…`) and the app's own home link (`/`).
+    // Through the gateway those resolve against the *gateway's* root, so the
+    // plugin bundle 404s and the page loads its shell but none of its behaviour:
+    // a title, a blank body, and a console full of 404s. Every wire-level test
+    // passed while this was broken, because the HTML itself arrived intact.
+    //
+    // The rewrite is textual and deliberately narrow: only `src`, `href`, and
+    // `action` attributes whose value starts with a single `/`, and only when
+    // that `/` is not already the prefix. `/i/<name>/...` is left alone, so a
+    // second pass is a no-op and a page that already names its prefix cannot be
+    // double-prefixed.
+    let is_html = is_rewritable_html(&parts.headers);
+    let mapped = if is_html {
+        // `collect` buffers the whole document; the harness's shell is tens of
+        // kilobytes, so the cap is generous and a body that exceeds it is
+        // reported rather than silently truncated.
+        match body.collect().await {
+            Ok(collected) => {
+                let bytes = collected.to_bytes();
+                if bytes.len() > state.config.max_buffered_body {
+                    return Err(ProxyError::new(
+                        ErrorCode::RelayUpstreamUnreachable,
+                        format!(
+                            "the HTML response is {} bytes, over the {} byte limit for rewriting",
+                            bytes.len(),
+                            state.config.max_buffered_body
+                        ),
+                    ));
+                }
+                let text = String::from_utf8_lossy(&bytes);
+                let rewritten = rewrite_root_absolute_urls(&text, prefix);
+                full_body(Bytes::from(rewritten))
+            }
+            // The upstream stream failed mid-body. Report it, rather than
+            // handing back a page whose plugin bundle will silently 404.
+            Err(e) => {
+                return Err(ProxyError::new(
+                    ErrorCode::RelayUpstreamUnreachable,
+                    format!("cannot read the HTML body to rewrite it: {e}"),
+                ));
+            }
+        }
+    } else {
+        StreamBody::new(futures_stream_map(body.into_data_stream())).boxed()
+    };
 
-    let mut out = Response::new(mapped.boxed());
+    let mut out = Response::new(mapped);
     *out.status_mut() = parts.status;
-    *out.headers_mut() = filter_headers(&parts.headers);
+    let mut headers = filter_headers(&parts.headers);
+    // The body changed length, so a length header from upstream is now wrong and
+    // would truncate the page or hang the client waiting for bytes that will not
+    // come.
+    headers.remove(header::CONTENT_LENGTH);
+    *out.headers_mut() = headers;
 
     // Re-attach the browser-side prefix to any redirect.
     //
@@ -465,6 +541,183 @@ async fn forward_http(
     let _guard = resp_task;
 
     Ok(out)
+}
+
+/// Whether a request is a navigation whose response may need rewriting.
+///
+/// Only HTML is rewritten, and only when the browser is asking for a document
+/// rather than an asset. A `GET` that accepts `text/html` is the shape of a
+/// navigation; a fetch for a script, an image, or an API endpoint is not, and
+/// leaving those `Accept-Encoding` untouched keeps them compressed on the wire.
+#[must_use]
+fn wants_html_rewrite(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| {
+            // `*/*` counts: a browser navigating from the address bar sends it,
+            // and the harness answers with HTML.
+            accept.contains("text/html") || accept.contains("*/*")
+        })
+}
+
+/// Whether a response body may be rewritten as text.
+///
+/// A compressed or otherwise encoded body must never be edited: its bytes are
+/// not the document, and searching them for markup finds nothing while any
+/// change corrupts the stream. The relay declines `Accept-Encoding` for
+/// navigations, but a client may still receive an encoded response from a
+/// caching intermediary or a harness that compresses unconditionally, so the
+/// decision is confirmed here rather than assumed.
+#[must_use]
+fn is_rewritable_html(headers: &HeaderMap) -> bool {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !content_type.contains("text/html") {
+        return false;
+    }
+
+    // Any encoding other than `identity` means the bytes are not the document.
+    match headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => true,
+        Some(encoding) => {
+            let e = encoding.trim().to_ascii_lowercase();
+            e.is_empty() || e == "identity"
+        }
+    }
+}
+
+/// Rewrite root-absolute URLs in an HTML document so they stay inside `prefix`.
+///
+/// `/plugins/??x` becomes `/i/main/plugins/??x`, and `href="/"` becomes
+/// `href="/i/main/"`. Relative URLs (`./assets/x`) are untouched, because the
+/// browser already resolves those against the prefixed request path.
+///
+/// # Why this is a text rewrite and not a parse
+///
+/// The harness's HTML is machine-generated and its attributes are simple, quoted
+/// values. A full parser would be a heavy dependency for a transformation this
+/// narrow, and it would also normalize parts of the document the harness may
+/// care about. The rewrite therefore touches only the three attributes that
+/// carry navigable URLs.
+///
+/// # What it deliberately does not touch
+///
+/// - `//host/path` — protocol-relative, an explicit other origin.
+/// - `/i/<name>/...` — already prefixed. Leaving it alone is what makes the
+///   rewrite idempotent, so a page passed through twice is not doubled into
+///   `/i/main/i/main/...`.
+/// - Anything outside those attributes, so a document that merely *mentions* a
+///   path is not rewritten.
+#[must_use]
+pub fn rewrite_root_absolute_urls(html: &str, prefix: &str) -> String {
+    if prefix.is_empty() {
+        return html.to_string();
+    }
+
+    rewrite_bootstrap_urls(&rewrite_attributes(html, prefix), prefix)
+}
+
+/// Rewrite the URL-bearing HTML attributes in a document.
+fn rewrite_attributes(html: &str, prefix: &str) -> String {
+    const ATTRIBUTES: [&str; 3] = ["src=\"", "href=\"", "action=\""];
+    let mut out = String::with_capacity(html.len() + 256);
+    let mut rest = html;
+
+    loop {
+        // The earliest occurrence of any tracked attribute.
+        let next = ATTRIBUTES
+            .iter()
+            .filter_map(|attr| rest.find(attr).map(|i| (i, *attr)))
+            .min_by_key(|(i, _)| *i);
+
+        let Some((index, attr)) = next else {
+            out.push_str(rest);
+            break;
+        };
+
+        let value_start = index + attr.len();
+        out.push_str(&rest[..value_start]);
+        let after_quote = &rest[value_start..];
+
+        // A value ends at the next quote. If there is none the document is
+        // malformed, so the remainder is left exactly as it was rather than
+        // guessed at.
+        let Some(end) = after_quote.find('"') else {
+            out.push_str(after_quote);
+            break;
+        };
+        let value = &after_quote[..end];
+
+        if needs_prefix(value, prefix) {
+            out.push_str(prefix);
+        }
+        out.push_str(value);
+        out.push('"');
+        rest = &after_quote[end + 1..];
+    }
+
+    out
+}
+
+/// Rewrite `"url":"/..."` fields in the harness's inline bootstrap JSON.
+///
+/// # Why the attribute rewrite is not enough
+///
+/// The document also contains `window.__DSH_BOOT__`, a JSON blob naming every
+/// client plugin the app must load — around fifty of them — each with a
+/// root-absolute `url`. That JSON is not an HTML attribute, so an attribute-based
+/// rewrite never sees it, and the loader then asks the gateway for
+/// `/plugins/??…` directly: a 404, an empty page, and an error banner reading
+/// "Failed to load plugins".
+///
+/// This is deliberately narrower than a JSON parse. The pattern is a fixed,
+/// machine-generated key, and rewriting only the value that follows it means a
+/// document that merely contains the text `"url":"/x"` elsewhere — or a string
+/// with an escaped quote — is left alone rather than guessed at.
+fn rewrite_bootstrap_urls(html: &str, prefix: &str) -> String {
+    const KEY: &str = "\"url\":\"";
+    let mut out = String::with_capacity(html.len() + 512);
+    let mut rest = html;
+
+    loop {
+        let Some(index) = rest.find(KEY) else {
+            out.push_str(rest);
+            break;
+        };
+        let value_start = index + KEY.len();
+        out.push_str(&rest[..value_start]);
+        let after_quote = &rest[value_start..];
+
+        let Some(end) = after_quote.find('"') else {
+            out.push_str(after_quote);
+            break;
+        };
+        let value = &after_quote[..end];
+
+        if needs_prefix(value, prefix) {
+            out.push_str(prefix);
+        }
+        out.push_str(value);
+        out.push('"');
+        rest = &after_quote[end + 1..];
+    }
+
+    out
+}
+
+/// Whether a URL value must be prefixed to stay inside the instance.
+fn needs_prefix(value: &str, prefix: &str) -> bool {
+    // Root-absolute, but not protocol-relative: `//host/x` names another origin
+    // explicitly, and rewriting it would send the browser somewhere it never
+    // meant to go.
+    value.starts_with('/') && !value.starts_with("//") && !path_matches(prefix, value)
 }
 
 /// Prefix a root-relative redirect so it stays inside the instance.
@@ -937,6 +1190,181 @@ mod tests {
         };
         assert_eq!(cfg.resolve("/i/app/deep/x").0, "http://127.0.0.1:4002");
         assert_eq!(cfg.resolve("/i/app/other").0, "http://127.0.0.1:4001");
+    }
+
+    #[test]
+    fn a_compressed_body_is_never_rewritten() {
+        // The failure this guards: rewriting gzip bytes produced a page the
+        // browser refused with ERR_CONTENT_DECODING_FAILED — worse than the 404s
+        // it replaced, because nothing rendered at all. Compressed bytes are not
+        // the document, so the rewrite must be skipped entirely.
+        let compressed = headers(&[
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-encoding", "gzip"),
+        ]);
+        assert!(!is_rewritable_html(&compressed));
+
+        let brotli = headers(&[
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-encoding", "br"),
+        ]);
+        assert!(!is_rewritable_html(&brotli));
+    }
+
+    #[test]
+    fn identity_encoding_is_rewritable() {
+        let plain = headers(&[("content-type", "text/html; charset=utf-8")]);
+        assert!(is_rewritable_html(&plain));
+
+        // An explicit `identity` is the same as none.
+        let explicit = headers(&[
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-encoding", "identity"),
+        ]);
+        assert!(is_rewritable_html(&explicit));
+    }
+
+    #[test]
+    fn only_html_is_rewritten() {
+        assert!(!is_rewritable_html(&headers(&[(
+            "content-type",
+            "text/javascript"
+        )])));
+        assert!(!is_rewritable_html(&headers(&[(
+            "content-type",
+            "application/json"
+        )])));
+        // Case-insensitive: a header value is not required to be lower-case.
+        assert!(is_rewritable_html(&headers(&[(
+            "content-type",
+            "TEXT/HTML"
+        )])));
+    }
+
+    #[test]
+    fn only_readers_of_html_have_compression_declined() {
+        // Declining `Accept-Encoding` for every request would silently uncompress
+        // every script and stylesheet on the wire, which is a real cost for no
+        // benefit: only navigations are rewritten.
+        assert!(wants_html_rewrite(&headers(&[(
+            "accept",
+            "text/html,application/xhtml+xml,*/*"
+        )])));
+        assert!(wants_html_rewrite(&headers(&[("accept", "*/*")])));
+        assert!(!wants_html_rewrite(&headers(&[(
+            "accept",
+            "application/json"
+        )])));
+        assert!(!wants_html_rewrite(&headers(&[(
+            "accept",
+            "image/png,image/*"
+        )])));
+        // No Accept at all: an API client, not a browser.
+        assert!(!wants_html_rewrite(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn bootstrap_plugin_urls_are_rewritten() {
+        // The second, less obvious half of the problem: the plugin list lives in
+        // inline JSON, not in an attribute, so the attribute rewrite never sees
+        // it. Missing these produced "Failed to load plugins" and an empty app.
+        let html = r#"<script>window["__DSH_BOOT__"]={"entries":[{"id":"x","url":"/plugins/??a.js&rev=1"}]}</script>"#;
+        let out = rewrite_root_absolute_urls(html, "/i/main");
+        assert!(
+            out.contains(r#""url":"/i/main/plugins/??a.js&rev=1""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_rewrite_is_idempotent_and_scoped() {
+        let html = r#"{"url":"/plugins/x"}"#;
+        let once = rewrite_root_absolute_urls(html, "/i/notes");
+        assert_eq!(once, r#"{"url":"/i/notes/plugins/x"}"#);
+        // A second pass must not double the prefix.
+        assert_eq!(rewrite_root_absolute_urls(&once, "/i/notes"), once);
+    }
+
+    #[test]
+    fn relative_and_external_bootstrap_urls_are_untouched() {
+        // Only root-absolute values are ours to rewrite. A relative one resolves
+        // correctly already, and an absolute one names somewhere else entirely.
+        let html = r#"{"url":"./local.js"},{"url":"http://cdn/x.js"},{"url":"//cdn/x.js"}"#;
+        assert_eq!(rewrite_root_absolute_urls(html, "/i/main"), html);
+    }
+
+    #[test]
+    fn root_absolute_urls_are_brought_inside_the_prefix() {
+        // The exact shapes the harness emits, and the reason this exists: the
+        // plugin bundle and the home link are root-absolute, so through the
+        // gateway they resolved to the control page's origin and 404ed. The page
+        // then loaded its shell and none of its behaviour.
+        let html = r#"<link href="/plugins/??a.js&rev=1"><script src="/assets/x.js"></script><a href="/">home</a>"#;
+        let out = rewrite_root_absolute_urls(html, "/i/main");
+        assert!(
+            out.contains(r#"href="/i/main/plugins/??a.js&rev=1""#),
+            "{out}"
+        );
+        assert!(out.contains(r#"src="/i/main/assets/x.js""#), "{out}");
+        assert!(out.contains(r#"href="/i/main/""#), "{out}");
+    }
+
+    #[test]
+    fn relative_urls_are_left_alone() {
+        // These already resolve against the prefixed request path, so prefixing
+        // them again would double it.
+        let html =
+            r#"<script src="./assets/index.js"></script><link href="./manifest.webmanifest">"#;
+        assert_eq!(rewrite_root_absolute_urls(html, "/i/main"), html);
+    }
+
+    #[test]
+    fn an_already_prefixed_page_is_unchanged() {
+        // Idempotence: rewriting twice must not produce `/i/main/i/main/...`.
+        let html = r#"<script src="/i/main/assets/x.js"></script>"#;
+        let once = rewrite_root_absolute_urls(html, "/i/main");
+        assert_eq!(once, html);
+        assert_eq!(rewrite_root_absolute_urls(&once, "/i/main"), html);
+    }
+
+    #[test]
+    fn a_protocol_relative_url_is_not_hijacked() {
+        // `//cdn/x` names another origin explicitly. Prefixing it would send the
+        // browser somewhere it never meant to go.
+        let html = r#"<script src="//cdn.example.com/x.js"></script>"#;
+        assert_eq!(rewrite_root_absolute_urls(html, "/i/main"), html);
+    }
+
+    #[test]
+    fn text_outside_attributes_is_not_rewritten() {
+        // The rewrite targets three attributes, not every slash in the document.
+        let html = "<p>A path like /plugins/x in prose stays as written.</p>";
+        assert_eq!(rewrite_root_absolute_urls(html, "/i/main"), html);
+    }
+
+    #[test]
+    fn an_unquoted_or_truncated_attribute_does_not_corrupt_the_document() {
+        // A malformed document must come back byte-identical rather than
+        // half-rewritten: a proxy that mangles HTML is worse than one that
+        // leaves it alone.
+        let html = r#"<div>href="/unclosed"#;
+        assert_eq!(rewrite_root_absolute_urls(html, "/i/main"), html);
+    }
+
+    #[test]
+    fn several_urls_in_one_document_are_all_rewritten() {
+        let html = r#"<a href="/a">1</a><img src="/b.png"><form action="/c">"#;
+        let out = rewrite_root_absolute_urls(html, "/i/notes");
+        assert!(out.contains(r#"href="/i/notes/a""#), "{out}");
+        assert!(out.contains(r#"src="/i/notes/b.png""#), "{out}");
+        assert!(out.contains(r#"action="/i/notes/c""#), "{out}");
+    }
+
+    #[test]
+    fn an_empty_prefix_changes_nothing() {
+        // The unrouted case: no instance to scope to, so nothing to rewrite.
+        let html = r#"<script src="/assets/x.js"></script>"#;
+        assert_eq!(rewrite_root_absolute_urls(html, ""), html);
     }
 
     #[test]
