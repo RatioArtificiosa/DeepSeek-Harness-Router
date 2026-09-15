@@ -32,7 +32,7 @@
   <rect width="1200" height="340" fill="url(#glow1)"/>
   <rect width="1200" height="340" fill="url(#glow2)"/>
 
-  <!-- Emblem: a routed, containerised node graph -->
+  <!-- Emblem: a routed node graph — one centre, many independent branches -->
   <g transform="translate(112,96)">
     <rect x="0" y="0" width="132" height="132" rx="30" fill="#0b1120" stroke="url(#accent)" stroke-width="2.5"/>
     <!-- hexagon core -->
@@ -54,31 +54,86 @@
   </g>
 
   <!-- Wordmark -->
-  <text x="286" y="132" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
-        font-size="24" font-weight="600" letter-spacing="7" fill="#5b7fb5">DEEPSEEK HARNESS</text>
-  <text x="282" y="204" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
-        font-size="76" font-weight="800" letter-spacing="1" fill="url(#title)">Router</text>
+  <text x="286" y="126" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+        font-size="22" font-weight="600" letter-spacing="6.5" fill="#5b7fb5">DEEPSEEK HARNESS</text>
+  <text x="282" y="196" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+        font-size="72" font-weight="800" letter-spacing="1" fill="url(#title)">Router</text>
 
   <!-- Accent rule -->
-  <rect x="286" y="224" width="300" height="4" rx="2" fill="url(#accent)"/>
+  <rect x="286" y="216" width="286" height="4" rx="2" fill="url(#accent)"/>
 
-  <text x="286" y="262" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
-        font-size="19" fill="#8fa6c9">Many agents in parallel. Each one its own</text>
-  <text x="286" y="290" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
-        font-size="19" fill="#8fa6c9">workspace, its own model, its own state.</text>
+  <text x="286" y="252" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+        font-size="18" fill="#8fa6c9">Many agents in parallel. Each one its own</text>
+  <text x="286" y="278" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+        font-size="18" fill="#8fa6c9">workspace, its own model, its own state.</text>
 
   <!-- Badges strip -->
-  <g font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="600">
-    <rect x="286" y="308" width="126" height="22" rx="11" fill="#4f8cff" fill-opacity="0.14" stroke="#4f8cff" stroke-opacity="0.45"/>
-    <text x="349" y="323" text-anchor="middle" fill="#8fb8ff">Multi-instance</text>
+  <g font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="600">
+    <rect x="286" y="298" width="122" height="22" rx="11" fill="#4f8cff" fill-opacity="0.14" stroke="#4f8cff" stroke-opacity="0.45"/>
+    <text x="347" y="313" text-anchor="middle" fill="#8fb8ff">Multi-instance</text>
 
-    <rect x="422" y="308" width="86" height="22" rx="11" fill="#7b5cff" fill-opacity="0.14" stroke="#7b5cff" stroke-opacity="0.45"/>
-    <text x="465" y="323" text-anchor="middle" fill="#b9a8ff">Rust core</text>
+    <rect x="418" y="298" width="84" height="22" rx="11" fill="#7b5cff" fill-opacity="0.14" stroke="#7b5cff" stroke-opacity="0.45"/>
+    <text x="460" y="313" text-anchor="middle" fill="#b9a8ff">Rust core</text>
 
-    <rect x="518" y="308" width="122" height="22" rx="11" fill="#37e0c8" fill-opacity="0.13" stroke="#37e0c8" stroke-opacity="0.42"/>
-    <text x="579" y="323" text-anchor="middle" fill="#7ce8d4">Isolated by design</text>
+    <rect x="512" y="298" width="120" height="22" rx="11" fill="#37e0c8" fill-opacity="0.13" stroke="#37e0c8" stroke-opacity="0.42"/>
+    <text x="572" y="313" text-anchor="middle" fill="#7ce8d4">Isolated by design</text>
 
-    <rect x="650" y="308" width="96" height="22" rx="11" fill="#ffffff" fill-opacity="0.07" stroke="#ffffff" stroke-opacity="0.22"/>
-    <text x="698" y="323" text-anchor="middle" fill="#c3d3ea">MIT licensed</text>
+    <rect x="642" y="298" width="94" height="22" rx="11" fill="#ffffff" fill-opacity="0.07" stroke="#ffffff" stroke-opacity="0.22"/>
+    <text x="689" y="313" text-anchor="middle" fill="#c3d3ea">MIT licensed</text>
+  </g>
+
+  <!-- ══ RIGHT PANEL: what it does, in one glance ══ -->
+  <g transform="translate(790,44)">
+    <rect x="0" y="0" width="366" height="252" rx="16" fill="#0d1628" fill-opacity="0.72" stroke="#22304d" stroke-width="1.4"/>
+
+    <text x="24" y="32" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+          font-size="11.5" font-weight="700" letter-spacing="1.6" fill="#5b7fb5">THE PROBLEM THIS SOLVES</text>
+
+    <!-- A miniature of the collision: two processes, one shared file -->
+    <g transform="translate(24,52)">
+      <rect x="0"   y="0" width="146" height="30" rx="8" fill="#141d33" stroke="#2b3d61" stroke-width="1.2"/>
+      <text x="12" y="20" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="11" fill="#8fb8ff">instance A</text>
+
+      <rect x="0"   y="40" width="146" height="30" rx="8" fill="#141d33" stroke="#2b3d61" stroke-width="1.2"/>
+      <text x="12" y="60" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="11" fill="#b9a8ff">instance B</text>
+
+      <!-- both arrows converge on one shared file -->
+      <path d="M152 15 H182 Q192 15 192 25 V44" fill="none" stroke="#ff6b6b" stroke-width="1.6" stroke-opacity="0.85"/>
+      <path d="M152 55 H182 Q192 55 192 45 V44" fill="none" stroke="#ff6b6b" stroke-width="1.6" stroke-opacity="0.85"/>
+
+      <rect x="164" y="44" width="118" height="30" rx="8" fill="#2a1622" stroke="#ff6b6b" stroke-opacity="0.55" stroke-width="1.2"/>
+      <text x="174" y="64" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="10.5" fill="#ff9d9d">workspace.json</text>
+      <text x="290" y="64" font-family="'Segoe UI', Arial, sans-serif" font-size="10.5" fill="#ff9d9d">✕</text>
+    </g>
+
+    <text x="24" y="146" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+          font-size="12.5" fill="#8fa6c9">Two harnesses in one state directory</text>
+    <text x="24" y="165" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+          font-size="12.5" fill="#8fa6c9">race over one file — last writer wins.</text>
+
+    <line x1="24" y1="184" x2="342" y2="184" stroke="#22304d" stroke-width="1"/>
+
+    <!-- the answer -->
+    <text x="24" y="210" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+          font-size="12.5" fill="#7ce8d4">✓  Router gives each instance its own</text>
+    <text x="40" y="230" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+          font-size="12.5" fill="#7ce8d4">state root. They never touch the same file.</text>
+  </g>
+
+  <!-- Port strip along the bottom -->
+  <g transform="translate(790,312)" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="11.5">
+    <rect x="0" y="0" width="76" height="22" rx="6" fill="#ffffff" fill-opacity="0.06" stroke="#ffffff" stroke-opacity="0.18"/>
+    <text x="38" y="15" text-anchor="middle" fill="#8fa6c9">:3080</text>
+
+    <rect x="86" y="0" width="76" height="22" rx="6" fill="#4f8cff" fill-opacity="0.16" stroke="#4f8cff" stroke-opacity="0.5"/>
+    <text x="124" y="15" text-anchor="middle" fill="#8fb8ff">:3081</text>
+
+    <rect x="172" y="0" width="76" height="22" rx="6" fill="#7b5cff" fill-opacity="0.16" stroke="#7b5cff" stroke-opacity="0.5"/>
+    <text x="210" y="15" text-anchor="middle" fill="#b9a8ff">:3082</text>
+
+    <rect x="258" y="0" width="76" height="22" rx="6" fill="#37e0c8" fill-opacity="0.15" stroke="#37e0c8" stroke-opacity="0.45"/>
+    <text x="296" y="15" text-anchor="middle" fill="#7ce8d4">:3083</text>
+
+    <text x="346" y="15" fill="#5b6f8f">…</text>
   </g>
 </svg>
