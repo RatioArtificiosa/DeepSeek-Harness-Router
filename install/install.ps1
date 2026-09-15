@@ -388,7 +388,22 @@ function Invoke-Main {
     Write-Head "Looking at this machine"
     Write-Item "Reading only — nothing is being changed yet." "DarkGray"
 
-    if ($Answers -and $Answers.Count -gt 0) { Set-ScriptedAnswers -Answers $Answers }
+    # `-Answers` may arrive as separate elements or as one comma-joined string.
+    #
+    # # Why both forms have to be accepted
+    #
+    # `pwsh -File script.ps1 -Answers 1,2,3` does **not** bind an array: the
+    # arguments reach a `-File` invocation as literal text, so the parameter
+    # receives the single string `"1,2,3"`. The queue then held one answer, the
+    # first prompt consumed it, and every later prompt went interactive — so an
+    # unattended install waited for a human while looking like it had been given
+    # its answers.
+    #
+    # Splitting on commas here makes both invocation styles work, which matters
+    # because the documented usage is the `-File` one.
+    $answers = @($Answers) | ForEach-Object { $_ -split ',' } | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }
+
+    if ($answers.Count -gt 0) { Set-ScriptedAnswers -Answers $answers }
     elseif ($Yes) {
         # Every recommended path: newest harness, copy everything, share keys.
         Set-ScriptedAnswers -Answers @("1","1","y","1","y")
