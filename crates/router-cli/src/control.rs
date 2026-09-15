@@ -63,6 +63,46 @@ pub fn relay_routes(registry: &Registry) -> Vec<router_relay::Route> {
         .collect()
 }
 
+/// Where the running gateway records the port it bound.
+///
+/// # Why this is a file
+///
+/// `router open` needs to know whether a gateway is running and where, and it is
+/// a *different process* from `router serve` — the same cross-process boundary
+/// that makes an instance record its browser URL. A file is again the simplest
+/// thing that can carry it.
+///
+/// It is deliberately runtime state, not configuration: `--port` is a choice
+/// made once at launch, and the file is removed when the gateway exits, so a
+/// stale entry cannot make `open` offer a link to nothing.
+#[must_use]
+pub fn gateway_port_path(home: &RouterHome) -> std::path::PathBuf {
+    home.root().join("gateway-port")
+}
+
+/// Record the port the gateway bound.
+fn write_gateway_port(home: &RouterHome, port: u16) {
+    // Best effort: failing to record the port makes `open` fall back to the
+    // direct instance URL, which still works. It is not worth refusing to serve
+    // over, but it is worth not panicking on.
+    let _ = std::fs::write(gateway_port_path(home), port.to_string());
+}
+
+/// Read the running gateway's port, if one was recorded.
+#[must_use]
+pub fn read_gateway_port(home: &RouterHome) -> Option<u16> {
+    std::fs::read_to_string(gateway_port_path(home))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Forget the recorded gateway port, once it is no longer answering.
+pub fn clear_gateway_port(home: &RouterHome) {
+    let _ = std::fs::remove_file(gateway_port_path(home));
+}
+
 /// Serve the control page and the instance gateway until interrupted.
 ///
 /// Two jobs on one port, and they belong together: the page is how a person
@@ -85,6 +125,10 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
         .local_addr()
         .map_err(|e| Failure::runtime(format!("cannot read the bound address: {e}"), ""))?;
     let url = format!("http://127.0.0.1:{}", actual.port());
+
+    // Recorded only once the socket is actually bound, so the file never claims
+    // a gateway that failed to start listening.
+    write_gateway_port(&home, actual.port());
 
     if style.verbosity != router_core::term::Verbosity::Quiet {
         term::out(&style.ok("Control page ready"));
@@ -219,9 +263,14 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
             }
         }));
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| Failure::runtime(format!("the server stopped: {e}"), ""))?;
+    let served = axum::serve(listener, app).await;
+
+    // The port is released here, so the record must go with it. Leaving it would
+    // let a later `router open` hand out a gateway URL that nothing answers —
+    // which reads as a router bug rather than a gateway that was stopped.
+    clear_gateway_port(&home);
+
+    served.map_err(|e| Failure::runtime(format!("the server stopped: {e}"), ""))?;
 
     Ok(ExitCode::SUCCESS)
 }

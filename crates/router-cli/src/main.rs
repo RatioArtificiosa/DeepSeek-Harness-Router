@@ -1192,9 +1192,27 @@ fn cmd_open(style: &Style, name: &str) -> Result<ExitCode, Failure> {
     // answered with "dsh web authentication required". So the URL is read from
     // where `start` recorded it, rather than rebuilt from the port — which is
     // what produced a link that could never work.
+    // The preferred URL goes through the running gateway when there is one.
+    //
+    // # Why the gateway URL wins
+    //
+    // Both URLs work in isolation, so this is a choice, not a correction. The
+    // gateway is preferred for two reasons: it is the same origin the control
+    // page uses, so a browser ends up with one tab per instance under one
+    // authority rather than one tab per port; and it is the path that is
+    // actually exercised, so a regression in the relay shows up here instead of
+    // hiding behind the direct route that bypasses it entirely.
+    //
+    // The direct URL remains the fallback, because a gateway that is not running
+    // is the normal case for someone who only ever uses `router open`.
     let instance_dir = home.instance_dir(name);
     let url = match router_dsh::browser::read(&instance_dir) {
-        Some(u) => u,
+        Some(u) => {
+            let via_gateway = control::read_gateway_port(&home)
+                .filter(|port| probe_port(*port))
+                .and_then(|port| gateway_url(&u, name, port));
+            via_gateway.unwrap_or(u)
+        }
         None => {
             // Something is listening but no token was recorded. Say what is
             // actually true instead of opening a page that will be refused.
@@ -1210,7 +1228,12 @@ fn cmd_open(style: &Style, name: &str) -> Result<ExitCode, Failure> {
 
     match open_browser(&url) {
         Ok(()) => {
-            if style.verbosity != Verbosity::Quiet {
+            if style.verbosity == Verbosity::Quiet {
+                // Quiet means "the answer, without the prose" — and for `open`
+                // the URL *is* the answer, not decoration. Printing nothing made
+                // `-q` useless for the one thing this command produces.
+                term::out(&url);
+            } else {
                 term::out(&style.ok(&format!("Opened {}", style.url(&url))));
             }
             Ok(ExitCode::SUCCESS)
@@ -1222,6 +1245,34 @@ fn cmd_open(style: &Style, name: &str) -> Result<ExitCode, Failure> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Rewrite an instance's direct URL onto the running gateway's origin.
+///
+/// Takes the harness's own URL — `http://127.0.0.1:<port>/?token=<t>` — and
+/// returns `http://127.0.0.1:<gateway>/i/<name>/?token=<t>`. Only the token is
+/// carried across: the port in the original URL belongs to the instance, and
+/// keeping it would point the browser at the authority the gateway exists to
+/// avoid.
+///
+/// Returns `None` when the input is not a URL this can safely rewrite, so a
+/// caller falls back to the direct link rather than being handed a malformed
+/// one. That is the right failure direction: a direct link still works, whereas
+/// a botched rewrite produces `dsh web authentication required` and looks like
+/// a fault.
+fn gateway_url(direct: &str, name: &str, gateway_port: u16) -> Option<String> {
+    let token = direct.split(['?', '&']).skip(1).find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == "token" && !value.is_empty()).then(|| value.to_string())
+    })?;
+
+    // The scheme is preserved rather than assumed, so this keeps working if the
+    // harness ever prints an https URL.
+    let scheme = direct.split("://").next().filter(|s| *s != direct)?;
+
+    Some(format!(
+        "{scheme}://127.0.0.1:{gateway_port}/i/{name}/?token={token}"
+    ))
 }
 
 async fn cmd_logs(style: &Style, name: &str) -> Result<ExitCode, Failure> {
@@ -1826,6 +1877,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_direct_url_is_rewritten_onto_the_gateway_origin() {
+        // The whole point: the instance's own port is replaced by the gateway's,
+        // and the instance is addressed by name, because the gateway is what
+        // makes one origin serve every instance.
+        let out = gateway_url("http://127.0.0.1:3082/?token=abc123", "main", 3090).unwrap();
+        assert_eq!(out, "http://127.0.0.1:3090/i/main/?token=abc123");
+    }
+
+    #[test]
+    fn the_original_port_never_leaks_into_the_gateway_url() {
+        // Keeping the instance port would defeat the entire reason the gateway
+        // exists: the browser would talk to an authority whose cookie it does
+        // not hold, which is the "failed to fetch gateway" failure again.
+        let out = gateway_url("http://127.0.0.1:3082/?token=abc", "main", 3090).unwrap();
+        assert!(!out.contains(":3082"), "got {out}");
+    }
+
+    #[test]
+    fn a_url_without_a_token_is_not_rewritten() {
+        // Rewriting preserves the token, so a URL with none would produce a
+        // gateway link that is refused. Falling back to the direct URL is
+        // better: it fails the same way, but for a reason the user can act on.
+        assert_eq!(gateway_url("http://127.0.0.1:3082/", "main", 3090), None);
+        assert_eq!(
+            gateway_url("http://127.0.0.1:3082/?token=", "main", 3090),
+            None
+        );
+    }
+
+    #[test]
+    fn the_scheme_is_preserved() {
+        // Not currently reachable — the harness prints http — but a rewrite
+        // that hard-codes http would silently downgrade an https URL rather
+        // than failing loudly.
+        let out = gateway_url("https://127.0.0.1:3082/?token=abc", "main", 3090).unwrap();
+        assert!(out.starts_with("https://"), "got {out}");
+    }
+
+    #[test]
+    fn a_token_is_found_among_other_parameters() {
+        let out = gateway_url("http://127.0.0.1:3082/?x=1&token=abc&y=2", "main", 3090).unwrap();
+        assert!(out.ends_with("token=abc"), "got {out}");
+    }
+
+    #[test]
+    fn a_name_is_used_verbatim_as_the_prefix() {
+        let out = gateway_url("http://127.0.0.1:3082/?token=t", "my-notes", 3090).unwrap();
+        assert!(out.contains("/i/my-notes/"), "got {out}");
+    }
+
+    #[test]
     fn compact_path_abbreviates_only_the_home_prefix() {
         let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
         if let Some(home) = home {
@@ -1893,22 +1995,34 @@ mod tests {
     fn probe_reports_a_real_http_server_as_serving() {
         // The positive case: something that answers HTTP.
         //
-        // # Why the mock serves in a loop
+        // # Why the mock reads before it writes
         //
-        // The first version accepted exactly one connection and exited, which is
-        // flaky by construction: the probe opens a connection, and any stray
-        // connect consumes the single accept, leaving the real probe to time out.
-        // It failed about one run in five. A test that fails at random teaches
-        // you to ignore failures, so the mock now answers every connection.
+        // Two earlier versions of this test were flaky, and the second one
+        // settled the cause. Accepting exactly one connection was the first bug
+        // — a stray connect could consume the only accept. Serving in a loop
+        // fixed that but still failed under a loaded machine, roughly when the
+        // whole suite ran in parallel.
+        //
+        // The remaining cause was the order of operations: the mock wrote its
+        // response without ever reading the request. A server that speaks before
+        // it listens can have its reply discarded, and the probe — which allows
+        // only [`PROBE_TIMEOUT`] for the connection, the write, and the read —
+        // then times out first. Reading the request makes this behave like an
+        // actual HTTP server, which is what the test claims to be testing.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            use std::io::Write as _;
+            use std::io::{Read as _, Write as _};
             // Bounded, so a probe bug cannot hang the suite forever.
             for _ in 0..16 {
                 let Ok((mut conn, _)) = listener.accept() else {
                     break;
                 };
+                // Drain the request first. The probe sends a full request line
+                // plus headers; reading it is what a real server does before it
+                // answers, and skipping it is what made this flaky.
+                let mut buf = [0u8; 512];
+                let _ = conn.read(&mut buf);
                 let _ = conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
                 let _ = conn.flush();
             }
