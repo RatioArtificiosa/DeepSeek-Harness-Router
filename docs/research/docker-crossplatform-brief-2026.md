@@ -16,7 +16,7 @@ Interpolation happens **after** `.env` parsing and **before** YAML merge, on a p
 ```
 volumes:
   - type: bind
-    source: C:\Users\Usuario\AppData\Local\Temp\dshpath\my project
+    source: C:\Users\you\Temp\proj\my project
     target: /ws
 ```
 → `docker compose run --rm t` printed `HELLO_SPACE_PATH`. Exit 0.
@@ -24,14 +24,14 @@ volumes:
 **[TESTED]** Double-quoted Windows path = hard parse failure. This YAML:
 ```yaml
 volumes:
-  - "C:\Users\Usuario\Temp\p:/ws"
+  - "C:\Users\you\Temp\p:/ws"
 ```
 fails with `failed to parse compose.yaml: yaml: while scanning a quoted scalar at line 5, column 14: did not find expected hexadecimal number`. The `\U` is read as the start of a `\uXXXX`-style escape. Compose never even reaches the path logic.
 
 **[TESTED]** Single-quoted forward-slash path works, spaces and all:
 ```yaml
 volumes:
-  - 'C:/Users/Usuario/AppData/Local/Temp/dshpath2/proj space:/ws'
+  - 'C:/Users/you/Temp/proj space:/ws'
 ```
 → parsed to `source: C:/Users/.../proj space`, `target: /ws`; run succeeded, printed `BS_TEST`, exit 0. Forward slashes are accepted by the Windows engine and sidestep backslash escaping.
 

@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 700" width="1160" height="700" role="img" aria-label="Architecture: host launcher, Docker container, Rust core, DeepSeek Harness runtime, and the mounted workspace">
+  <defs>
+    <linearGradient id="bgA" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a0e1a"/><stop offset="100%" stop-color="#0b1120"/>
+    </linearGradient>
+    <linearGradient id="rustG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f74c00"/><stop offset="100%" stop-color="#ff8a3d"/>
+    </linearGradient>
+    <linearGradient id="nodeG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#539e43"/><stop offset="100%" stop-color="#8cc84b"/>
+    </linearGradient>
+    <linearGradient id="flowG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4f8cff"/><stop offset="100%" stop-color="#37e0c8"/>
+    </linearGradient>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#4f8cff"/>
+    </marker>
+    <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#37e0c8"/>
+    </marker>
+    <style>
+      .L   { font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif; }
+      .ttl { font-size:13px; font-weight:700; letter-spacing:1.6px; fill:#5b7fb5; }
+      .h   { font-size:16.5px; font-weight:700; fill:#eaf1ff; }
+      .b   { font-size:13px; fill:#8fa6c9; }
+      .m   { font-family:ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace; font-size:12.5px; fill:#9db3d4; }
+      .tag { font-size:11.5px; font-weight:700; }
+    </style>
+  </defs>
+
+  <rect width="1160" height="700" fill="url(#bgA)"/>
+
+  <!-- ============ HOST ============ -->
+  <rect x="20" y="20" width="1120" height="150" rx="16" fill="#0d1628" stroke="#22304d" stroke-width="1.5" stroke-dasharray="7 5"/>
+  <text x="44" y="52" class="L ttl">YOUR MACHINE — WINDOWS · macOS · LINUX</text>
+
+  <!-- launcher box -->
+  <rect x="44" y="70" width="330" height="76" rx="12" fill="#111c33" stroke="#2b3d61" stroke-width="1.4"/>
+  <text x="66" y="100" class="L h">Launcher</text>
+  <text x="66" y="122" class="m">start.sh   ·   start.ps1</text>
+  <text x="66" y="140" class="L b">Native per platform, one shared config.</text>
+
+  <!-- docker engine box -->
+  <rect x="396" y="70" width="330" height="76" rx="12" fill="#111c33" stroke="#2b3d61" stroke-width="1.4"/>
+  <text x="418" y="100" class="L h">Docker Engine</text>
+  <text x="418" y="122" class="m">compose up --wait</text>
+  <text x="418" y="140" class="L b">Builds, starts, reports health.</text>
+
+  <!-- browser box -->
+  <rect x="748" y="70" width="368" height="76" rx="12" fill="#111c33" stroke="#2b3d61" stroke-width="1.4"/>
+  <text x="770" y="100" class="L h">Browser</text>
+  <text x="770" y="122" class="m">http://127.0.0.1:3080</text>
+  <text x="770" y="140" class="L b">Opened for you. The only thing you touch.</text>
+
+  <!-- host arrows -->
+  <line x1="374" y1="108" x2="396" y2="108" stroke="#4f8cff" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="726" y1="108" x2="748" y2="108" stroke="#37e0c8" stroke-width="2" marker-end="url(#ar2)"/>
+
+  <!-- ============ CONTAINER ============ -->
+  <rect x="20" y="200" width="1120" height="392" rx="18" fill="#0c1424" stroke="url(#flowG)" stroke-width="2"/>
+  <rect x="20" y="200" width="1120" height="42" rx="18" fill="#101d38"/>
+  <rect x="20" y="224" width="1120" height="18" fill="#101d38"/>
+  <text x="44" y="227" class="L ttl" fill="#7cd8ff">DOCKER CONTAINER — ONE IMAGE, ONE PROCESS TREE</text>
+
+  <!-- Rust core -->
+  <rect x="48" y="266" width="500" height="212" rx="14" fill="#141c2e" stroke="#ff8a3d" stroke-opacity="0.55" stroke-width="1.6"/>
+  <rect x="48" y="266" width="500" height="4" rx="2" fill="url(#rustG)"/>
+  <text x="72" y="296" class="L h">Router Core</text>
+  <text x="196" y="296" class="L tag" fill="#ff8a3d">RUST · STATIC BINARY</text>
+
+  <g class="L b">
+    <circle cx="80" cy="326" r="3.4" fill="#4f8cff"/>
+    <text x="96" y="331">Health endpoint and check aggregation</text>
+    <circle cx="80" cy="352" r="3.4" fill="#4f8cff"/>
+    <text x="96" y="357">Runtime supervision, restarts, readiness</text>
+    <circle cx="80" cy="378" r="3.4" fill="#37e0c8"/>
+    <text x="96" y="383">HTTP · WebSocket · SSE relay to loopback</text>
+    <circle cx="80" cy="404" r="3.4" fill="#37e0c8"/>
+    <text x="96" y="409">Workspace path validation and denial rules</text>
+    <circle cx="80" cy="430" r="3.4" fill="#7b5cff"/>
+    <text x="96" y="435">Event fan-out and structured logging</text>
+    <circle cx="80" cy="456" r="3.4" fill="#7b5cff"/>
+    <text x="96" y="461">Privilege drop and write-access checks</text>
+  </g>
+
+  <!-- DSH -->
+  <rect x="612" y="266" width="500" height="212" rx="14" fill="#141c2e" stroke="#8cc84b" stroke-opacity="0.55" stroke-width="1.6"/>
+  <rect x="612" y="266" width="500" height="4" rx="2" fill="url(#nodeG)"/>
+  <text x="636" y="296" class="L h">DeepSeek Harness</text>
+  <text x="796" y="296" class="L tag" fill="#8cc84b">NODE.JS · PINNED IN THE IMAGE</text>
+
+  <g class="L b">
+    <circle cx="644" cy="326" r="3.4" fill="#8cc84b"/>
+    <text x="660" y="331">Agent loop, tools, and session log</text>
+    <circle cx="644" cy="352" r="3.4" fill="#8cc84b"/>
+    <text x="660" y="357">Model adapters and provider routing</text>
+    <circle cx="644" cy="378" r="3.4" fill="#8cc84b"/>
+    <text x="660" y="383">Filesystem, shell, and search tools</text>
+    <circle cx="644" cy="404" r="3.4" fill="#8cc84b"/>
+    <text x="660" y="409">Browser UI (served on loopback only)</text>
+    <circle cx="644" cy="430" r="3.4" fill="#8cc84b"/>
+    <text x="660" y="435">Sandbox and approval seams</text>
+  </g>
+
+  <!-- inter-core arrow -->
+  <line x1="548" y1="340" x2="612" y2="340" stroke="#4f8cff" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="552" y="330" class="m" fill="#7d8fab">JSON-RPC</text>
+  <text x="552" y="358" class="m" fill="#7d8fab">over stdio</text>
+  <line x1="612" y1="404" x2="548" y2="404" stroke="#37e0c8" stroke-width="2" marker-end="url(#ar2)"/>
+  <text x="552" y="396" class="m" fill="#7d8fab">events</text>
+
+  <!-- volumes row -->
+  <rect x="48" y="500" width="500" height="70" rx="12" fill="#101a30" stroke="#2b3d61" stroke-width="1.4"/>
+  <text x="72" y="528" class="L h" font-size="14.5">/workspace</text>
+  <text x="176" y="528" class="L tag" fill="#37e0c8">BIND MOUNT</text>
+  <text x="72" y="550" class="L b">Your one project directory, read and written for real.</text>
+
+  <rect x="612" y="500" width="500" height="70" rx="12" fill="#101a30" stroke="#2b3d61" stroke-width="1.4"/>
+  <text x="636" y="528" class="L h" font-size="14.5">/data</text>
+  <text x="692" y="528" class="L tag" fill="#8fb8ff">NAMED VOLUME</text>
+  <text x="636" y="550" class="L b">Sessions, settings, credentials, logs. Yours to remove.</text>
+
+  <!-- ============ FILESYSTEM ============ -->
+  <rect x="300" y="620" width="560" height="60" rx="14" fill="#0d1628" stroke="#22304d" stroke-width="1.5" stroke-dasharray="7 5"/>
+  <text x="580" y="646" text-anchor="middle" class="L h" font-size="15">Your project directory</text>
+  <text x="580" y="667" text-anchor="middle" class="L b">The real files. Nothing is copied into the container.</text>
+  <line x1="298" y1="535" x2="298" y2="650" stroke="#37e0c8" stroke-width="2" stroke-dasharray="5 4" fill="none"/>
+  <line x1="298" y1="650" x2="300" y2="650" stroke="#37e0c8" stroke-width="2" marker-end="url(#ar2)"/>
+</svg>

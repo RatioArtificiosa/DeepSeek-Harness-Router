@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 620" width="1160" height="620" role="img" aria-label="Terminal session showing DeepSeek Harness Router starting up in four commands">
+  <defs>
+    <linearGradient id="term" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#0c1120"/>
+      <stop offset="100%" stop-color="#0a0e1a"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#141d33"/>
+      <stop offset="100%" stop-color="#101728"/>
+    </linearGradient>
+    <linearGradient id="boxline" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#4f8cff"/>
+      <stop offset="100%" stop-color="#37e0c8"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .m { font-family: ui-monospace, 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, monospace; }
+      .t { font-size: 15px; }
+      .dim   { fill: #5b6b86; }
+      .txt   { fill: #c2cee0; }
+      .cmd   { fill: #eaf1ff; }
+      .ok    { fill: #37e0c8; }
+      .warn  { fill: #ffce6a; }
+      .url   { fill: #8fb8ff; font-weight: 700; }
+      .lbl   { fill: #7d8fab; }
+      .val   { fill: #d7e3f5; }
+    </style>
+  </defs>
+
+  <!-- Full-bleed dark canvas so the rounded frame never shows a light corner -->
+  <rect width="1160" height="620" fill="url(#term)"/>
+  <rect x="0.75" y="0.75" width="1158.5" height="618.5" rx="13.5" fill="none" stroke="#233150" stroke-width="1.5"/>
+
+  <!-- Title bar -->
+  <path d="M0 14 A14 14 0 0 1 14 0 H1146 A14 14 0 0 1 1160 14 V48 H0 Z" fill="url(#bar)"/>
+  <line x1="0" y1="48" x2="1160" y2="48" stroke="#233150" stroke-width="1.5"/>
+  <circle cx="26" cy="24" r="6.5" fill="#ff5f57"/>
+  <circle cx="48" cy="24" r="6.5" fill="#febc2e"/>
+  <circle cx="70" cy="24" r="6.5" fill="#28c840"/>
+  <text x="580" y="29" text-anchor="middle" class="m t" fill="#7d8fab">Terminal</text>
+
+  <!-- Line 1: clone -->
+  <g class="m t">
+    <text x="32" y="86"  class="dim">$</text>
+    <text x="52" y="86"  class="cmd">git clone https://github.com/RatioArtificiosa/DeepSeek-Harness-Router.git</text>
+    <text x="32" y="110" class="dim">Cloning into 'DeepSeek-Harness-Router'...</text>
+
+    <!-- Line 2: enter -->
+    <text x="32" y="146" class="dim">$</text>
+    <text x="52" y="146" class="cmd">cd DeepSeek-Harness-Router</text>
+
+    <!-- Line 3: start -->
+    <text x="32" y="182" class="dim">$</text>
+    <text x="52" y="182" class="cmd">./start.sh</text>
+  </g>
+
+  <!-- The program's own output -->
+  <g class="m t">
+    <text x="52" y="222" fill="#4f8cff" font-weight="700">DeepSeek Harness Router</text>
+    <text x="266" y="222" class="dim">v1.0.0</text>
+
+    <!-- checks -->
+    <text x="52" y="256" class="ok">✓</text>
+    <text x="72" y="256" class="lbl">Docker</text>
+    <text x="132" y="256" class="val">29.6.1</text>
+    <text x="196" y="256" class="dim">·</text>
+    <text x="210" y="256" class="lbl">Compose</text>
+    <text x="286" y="256" class="val">v5.2.0</text>
+
+    <text x="52" y="280" class="ok">✓</text>
+    <text x="72" y="280" class="lbl">Image</text>
+    <text x="130" y="280" class="val">deepseek-harness-router:1.0.0</text>
+
+    <text x="52" y="304" class="ok">✓</text>
+    <text x="72" y="304" class="lbl">Workspace</text>
+    <text x="164" y="304" class="val">/workspace</text>
+    <text x="284" y="304" class="dim">mounted, writable</text>
+
+    <text x="52" y="328" class="ok">✓</text>
+    <text x="72" y="328" class="lbl">Port</text>
+    <text x="126" y="328" class="val">3080</text>
+    <text x="178" y="328" class="dim">free</text>
+
+    <text x="52" y="366" class="dim">Starting…</text>
+
+    <text x="52" y="398" class="ok">✓</text>
+    <text x="72" y="398" class="lbl">Router core</text>
+    <text x="176" y="398" class="val">rust · static</text>
+
+    <text x="52" y="422" class="ok">✓</text>
+    <text x="72" y="422" class="lbl">Harness runtime</text>
+    <text x="220" y="422" class="val">0.1.5-rc.1</text>
+
+    <text x="52" y="446" class="ok">✓</text>
+    <text x="72" y="446" class="lbl">Session store</text>
+    <text x="200" y="446" class="val">ready</text>
+
+    <text x="52" y="470" class="ok">✓</text>
+    <text x="72" y="470" class="lbl">Sandbox</text>
+    <text x="158" y="470" class="val">landlock</text>
+    <text x="242" y="470" class="dim">full enforcement</text>
+  </g>
+
+  <!-- The URL box -->
+  <g>
+    <rect x="46" y="496" width="520" height="76" rx="12" fill="#101a30" stroke="url(#boxline)" stroke-width="1.6"/>
+    <text x="72" y="530" class="m t" fill="#7d8fab">Ready</text>
+    <text x="132" y="530" class="m t" fill="#37e0c8" font-weight="700">→</text>
+    <text x="164" y="530" class="m" font-size="22" font-weight="800" fill="#8fb8ff">http://127.0.0.1:3080</text>
+    <text x="72" y="556" class="m t" fill="#5b6b86">Stop with </text>
+    <text x="160" y="556" class="m t" fill="#c2cee0">./stop.sh</text>
+  </g>
+
+  <!-- Right column: what is happening -->
+  <g class="m" font-size="13.5">
+    <rect x="606" y="196" width="522" height="376" rx="12" fill="#0d1424" stroke="#233150" stroke-width="1.4"/>
+    <text x="632" y="228" fill="#5b7fb5" font-weight="700" letter-spacing="1.5">WHAT JUST HAPPENED</text>
+    <line x1="632" y1="242" x2="1102" y2="242" stroke="#233150" stroke-width="1"/>
+
+    <text x="632" y="274" fill="#37e0c8">1</text>
+    <text x="654" y="274" fill="#c2cee0">A container started — nothing was</text>
+    <text x="654" y="294" fill="#c2cee0">installed on your machine.</text>
+
+    <text x="632" y="330" fill="#37e0c8">2</text>
+    <text x="654" y="330" fill="#c2cee0">Your project directory is mounted at</text>
+    <text x="654" y="350" fill="#8fb8ff">/workspace</text>
+    <text x="756" y="350" fill="#c2cee0"> — the agent edits your</text>
+    <text x="654" y="370" fill="#c2cee0">real files.</text>
+
+    <text x="632" y="406" fill="#37e0c8">3</text>
+    <text x="654" y="406" fill="#c2cee0">The runtime is confined by the kernel,</text>
+    <text x="654" y="426" fill="#c2cee0">so it cannot write outside the workspace.</text>
+
+    <text x="632" y="462" fill="#37e0c8">4</text>
+    <text x="654" y="462" fill="#c2cee0">Your existing DeepSeek Harness install</text>
+    <text x="654" y="482" fill="#c2cee0">is untouched — this one is separate.</text>
+
+    <line x1="632" y1="504" x2="1102" y2="504" stroke="#233150" stroke-width="1"/>
+    <text x="632" y="532" fill="#5b6f8f">No Node.js.  No pnpm.  No global install.</text>
+    <text x="632" y="554" fill="#5b6f8f">Just Docker.</text>
+  </g>
+</svg>

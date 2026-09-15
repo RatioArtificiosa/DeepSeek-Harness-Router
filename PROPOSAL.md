@@ -256,8 +256,8 @@ This section records what was verified **against the live system and upstream so
 |---|---|---|---|
 | **3080** | **LISTENING** | **PID 38368 — `dsh web --no-open`** (the DSH instance I am running inside) | **3080 is unusable as our default.** See §P-04.3. |
 | **3081** | **LISTENING** | **PID 51092 — `dsh web --port 3081 --no-open`** (this very session) | Unusable. |
-| 55432 | LISTENING (container `rh-pg`) | postgres:17-alpine | Not ours. Do not touch. |
-| 5433 | LISTENING (container `aifs-postgres`) | pgvector/pgvector:pg17 | Not ours. Do not touch. |
+| 55432 | LISTENING (container `unrelated-container`) | postgres:17-alpine | Not ours. Do not touch. |
+| 5433 | LISTENING (container an unrelated container) | pgvector/pgvector:pg17 | Not ours. Do not touch. |
 
 > **This is the single most important environmental discovery.** The source document assumes port 3080 is free (it is DSH's own default). On this development machine it is permanently occupied by the harness we are working inside. A naive implementation would fail its very first `start.ps1` run with `EADDRINUSE`.
 
@@ -266,13 +266,13 @@ This section records what was verified **against the live system and upstream so
 **Running containers (both pre-existing, both off-limits):**
 
 ```text
-bf28837a024a   rh-pg           postgres:17-alpine        Up 24 hours   0.0.0.0:55432->5432/tcp
-fc65737e94fe   aifs-postgres   pgvector/pgvector:pg17    Up 5 days     127.0.0.1:5433->5432/tcp
+xxxxxxxxxxxx   unrelated-container           postgres:17-alpine        Up (long-running)   0.0.0.0:55432->5432/tcp
+xxxxxxxxxxxx   unrelated-container   pgvector/pgvector:pg17    Up (long-running)     127.0.0.1:5433->5432/tcp
 ```
 
 **Networks present:** only the three built-ins — `bridge`, `host`, `none`. No project networks exist, so our Compose project network will be created fresh and cannot collide.
 
-**Volumes present:** ~60 anonymous volumes plus two named ones owned by other projects (`aifs-pgdata`, `librechat_pgdata2`). **None may be pruned or removed.**
+**Volumes present:** ~60 anonymous volumes plus two named ones owned by other projects (owned by unrelated projects). **None may be pruned or removed.**
 
 **Images present:** postgres 16/17-alpine, pgvector, mongo, meilisearch, LibreChat, coolify-demo-app, node:18-alpine, plus (pulled during this research) `alpine:latest` and `node:22-bookworm-slim`.
 
@@ -282,7 +282,7 @@ fc65737e94fe   aifs-postgres   pgvector/pgvector:pg17    Up 5 days     127.0.0.1
 
 The installed `dsh` gives us the reference implementation our container must reproduce.
 
-**Package:** `@deepseek-ai/dsh` v`0.1.5-rc.1` at `C:\Users\Usuario\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh` (213 MB, 239 bundled `@deepseek-ai/*` packages).
+**Package:** `@deepseek-ai/dsh` v`0.1.5-rc.1` at `your npm global prefix\node_modules\@deepseek-ai\dsh` (213 MB, 239 bundled `@deepseek-ai/*` packages).
 
 **npm registry state (verified):**
 
@@ -491,8 +491,8 @@ These are non-negotiable. They override any later convenience.
 
 | ID | Rule |
 |---|---|
-| **C-01** | Never modify, move, delete, or upgrade `C:\Users\Usuario\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh` |
-| **C-02** | Never write to `C:\Users\Usuario\.dsh` — this is the live harness home. Not `settings.yaml`, not `.credentials.yaml`, not `profiles/`, not `sessions/`, not `storages/`, not `timer-agent/` |
+| **C-01** | Never modify, move, delete, or upgrade `your npm global prefix\node_modules\@deepseek-ai\dsh` |
+| **C-02** | Never write to `the harness home (~/.dsh on the host)` — this is the live harness home. Not `settings.yaml`, not `.credentials.yaml`, not `profiles/`, not `sessions/`, not `storages/`, not `timer-agent/` |
 | **C-03** | Never add, modify, or remove a DSH plugin in the host's `web` profile |
 | **C-04** | Never restart or stop the DSH processes (PID 38368 on :3080, PID 51092 on :3081) |
 | **C-05** | Never modify the host `settings.yaml` — it contains live provider configuration and a session header |
@@ -504,9 +504,9 @@ These are non-negotiable. They override any later convenience.
 
 | ID | Rule |
 |---|---|
-| **C-07** | Never remove, prune, stop, or restart any container we did not create — specifically `rh-pg` and `aifs-postgres` |
+| **C-07** | Never remove, prune, stop, or restart any container we did not create — specifically any container this project did not create |
 | **C-08** | Never run `docker system prune`, `docker volume prune`, `docker image prune`, or `docker network prune` |
-| **C-09** | Never delete or rename existing volumes (`aifs-pgdata`, `librechat_pgdata2`, or any anonymous volume) |
+| **C-09** | Never delete or rename existing volumes (any volume this project does not own) |
 | **C-10** | All our resources are namespaced: project name `deepseek-router`, volumes `<project>_agent-data`, network `<project>_default`, containers `<project>-*` |
 | **C-11** | Destructive operations must be scoped to our project: `docker compose -p deepseek-router down -v`, never `docker compose down` from another directory |
 
@@ -543,7 +543,7 @@ The container and the host installation share a machine and nothing else.
 
 | Resource | Host DSH | Containerized Router | Collision risk |
 |---|---|---|---|
-| DSH home | `C:\Users\Usuario\.dsh` | `/data/dsh` (in `agent-data` volume) | **None** — different filesystems |
+| DSH home | `the harness home (~/.dsh on the host)` | `/data/dsh` (in `agent-data` volume) | **None** — different filesystems |
 | Config | host `settings.yaml` | `/data/dsh/settings.yaml` | None |
 | Credentials | host `.credentials.yaml` | `/data/dsh/.credentials.yaml` | None |
 | Sessions | `~/.dsh/sessions/` | `/data/dsh/sessions/` | None |
@@ -569,7 +569,7 @@ This single line is what makes the two installations completely independent. The
 Tempting, and explicitly rejected:
 
 1. It would let the container **mutate the live harness** — violating C-02 and R-53.
-2. The host's `settings.yaml` contains **absolute Windows paths** (e.g. a rust-analyzer shim at `C:\Users\Usuario\.cargo\bin\rust-analyzer.exe`) that are meaningless inside a Linux container.
+2. The host's `settings.yaml` contains **absolute Windows paths** (e.g. a rust-analyzer shim at `a rust-analyzer shim under the host toolchain`) that are meaningless inside a Linux container.
 3. Credentials would be shared across a boundary that the source document says must be independent.
 4. A container write could corrupt a live session log.
 
@@ -1736,7 +1736,7 @@ Defaults are conservative but not artificially restrictive — an agent legitima
 |---|---|---|
 | **Inbound** | Only the published port, bound to `127.0.0.1` **on the host** | `<host>:127.0.0.1:${APP_PORT}:3080` — publish to loopback only, not `0.0.0.0` |
 | **Outbound** | Allowed (1000BASE) | The agent needs the model API, package registries, web fetch |
-| **Between containers** | Our own Compose network only | No `external` networks; cannot reach `rh-pg` or `aifs-postgres` |
+| **Between containers** | Our own Compose network only | No `external` networks; cannot reach unrelated containers |
 
 > **Key detail:** Compose publishes to `0.0.0.0` by default. We bind to loopback on the host:
 > ```yaml

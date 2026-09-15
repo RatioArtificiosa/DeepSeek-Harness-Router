@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 470" width="1160" height="470" role="img" aria-label="Six benefits of DeepSeek Harness Router">
+  <defs>
+    <linearGradient id="bgg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a0e1a"/><stop offset="100%" stop-color="#0b1120"/>
+    </linearGradient>
+    <linearGradient id="s1" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#4f8cff"/><stop offset="100%" stop-color="#6f7bff"/></linearGradient>
+    <linearGradient id="s2" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#7b5cff"/><stop offset="100%" stop-color="#b05cff"/></linearGradient>
+    <linearGradient id="s3" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#37e0c8"/><stop offset="100%" stop-color="#37b0e0"/></linearGradient>
+    <style>
+      .h  { font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif; font-size:17px; font-weight:700; fill:#eaf1ff; }
+      .b  { font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif; font-size:13.5px; fill:#8fa6c9; }
+      .k  { font-family:ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace; font-size:12.5px; fill:#7ce8d4; }
+      .t  { font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="1160" height="470" fill="url(#bgg)"/>
+
+  <!-- Card geometry: 3 across, 2 down. Card 356 wide, 26 gap -->
+  <!-- ROW 1 -->
+  <g>
+    <!-- 1 -->
+    <rect x="14" y="14" width="356" height="212" rx="16" fill="#101a30" stroke="#22304d" stroke-width="1.4"/>
+    <rect x="14" y="14" width="356" height="4" rx="2" fill="url(#s1)"/>
+    <g transform="translate(42,44)">
+      <rect x="0" y="0" width="44" height="44" rx="12" fill="#4f8cff" fill-opacity="0.14" stroke="#4f8cff" stroke-opacity="0.5"/>
+      <path d="M12 15 h20 v14 a5 5 0 0 1 -5 5 h-10 a5 5 0 0 1 -5 -5 z" fill="none" stroke="#8fb8ff" stroke-width="2"/>
+      <path d="M22 9 v6" stroke="#8fb8ff" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="16" cy="21" r="1.6" fill="#8fb8ff"/><circle cx="22" cy="21" r="1.6" fill="#8fb8ff"/><circle cx="28" cy="21" r="1.6" fill="#8fb8ff"/>
+    </g>
+    <text x="42" y="122" class="h">Nothing to install on your host</text>
+    <text x="42" y="148" class="b">No Node.js. No pnpm. No global packages.</text>
+    <text x="42" y="170" class="b">Docker is the only prerequisite — the</text>
+    <text x="42" y="192" class="b">whole runtime lives in the image.</text>
+
+    <!-- 2 -->
+    <rect x="402" y="14" width="356" height="212" rx="16" fill="#101a30" stroke="#22304d" stroke-width="1.4"/>
+    <rect x="402" y="14" width="356" height="4" rx="2" fill="url(#s2)"/>
+    <g transform="translate(430,44)">
+      <rect x="0" y="0" width="44" height="44" rx="12" fill="#7b5cff" fill-opacity="0.14" stroke="#7b5cff" stroke-opacity="0.5"/>
+      <circle cx="22" cy="22" r="11" fill="none" stroke="#b9a8ff" stroke-width="2"/>
+      <path d="M22 15 v7 l5 4" fill="none" stroke="#b9a8ff" stroke-width="2" stroke-linecap="round"/>
+    </g>
+    <text x="430" y="122" class="h">The same environment, every time</text>
+    <text x="430" y="148" class="b">The harness version is pinned inside</text>
+    <text x="430" y="170" class="b">the image and recorded. Two people on</text>
+    <text x="430" y="192" class="b">two machines get one identical runtime.</text>
+
+    <!-- 3 -->
+    <rect x="790" y="14" width="356" height="212" rx="16" fill="#101a30" stroke="#22304d" stroke-width="1.4"/>
+    <rect x="790" y="14" width="356" height="4" rx="2" fill="url(#s3)"/>
+    <g transform="translate(818,44)">
+      <rect x="0" y="0" width="44" height="44" rx="12" fill="#37e0c8" fill-opacity="0.13" stroke="#37e0c8" stroke-opacity="0.45"/>
+      <path d="M22 10 l10 6 v12 l-10 6 -10 -6 v-12 z" fill="none" stroke="#7ce8d4" stroke-width="2" stroke-linejoin="round"/>
+      <circle cx="22" cy="22" r="3.4" fill="#7ce8d4"/>
+    </g>
+    <text x="818" y="122" class="h">Your files, not a copy</text>
+    <text x="818" y="148" class="b">One directory is mounted at <tspan class="k">/workspace</tspan>.</text>
+    <text x="818" y="170" class="b">The agent reads and edits your real</text>
+    <text x="818" y="192" class="b">project, so your tooling keeps working.</text>
+  </g>
+
+  <!-- ROW 2 -->
+  <g>
+    <!-- 4 -->
+    <rect x="14" y="244" width="356" height="212" rx="16" fill="#101a30" stroke="#22304d" stroke-width="1.4"/>
+    <rect x="14" y="244" width="356" height="4" rx="2" fill="url(#s3)"/>
+    <g transform="translate(42,274)">
+      <rect x="0" y="0" width="44" height="44" rx="12" fill="#37e0c8" fill-opacity="0.13" stroke="#37e0c8" stroke-opacity="0.45"/>
+      <path d="M22 9 l12 5 v9 c0 7 -5 12 -12 14 -7 -2 -12 -7 -12 -14 v-9 z" fill="none" stroke="#7ce8d4" stroke-width="2"/>
+      <path d="M17 22 l4 4 7 -8" fill="none" stroke="#7ce8d4" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <text x="42" y="352" class="h">Confined by the kernel</text>
+    <text x="42" y="378" class="b">Processes run under a kernel-enforced</text>
+    <text x="42" y="400" class="b">filesystem policy. Writes outside the</text>
+    <text x="42" y="422" class="b">workspace are denied, and failures are loud.</text>
+
+    <!-- 5 -->
+    <rect x="402" y="244" width="356" height="212" rx="16" fill="#101a30" stroke="#22304d" stroke-width="1.4"/>
+    <rect x="402" y="244" width="356" height="4" rx="2" fill="url(#s1)"/>
+    <g transform="translate(430,274)">
+      <rect x="0" y="0" width="44" height="44" rx="12" fill="#4f8cff" fill-opacity="0.14" stroke="#4f8cff" stroke-opacity="0.5"/>
+      <path d="M14 30 h16 M22 14 v16" stroke="#8fb8ff" stroke-width="2" stroke-linecap="round"/>
+      <rect x="10" y="10" width="24" height="24" rx="6" fill="none" stroke="#8fb8ff" stroke-width="2"/>
+    </g>
+    <text x="430" y="352" class="h">Disposable when you want it gone</text>
+    <text x="430" y="378" class="b">Everything the app manages lives in one</text>
+    <text x="430" y="400" class="b">volume. Remove it and the machine is</text>
+    <text x="430" y="422" class="b">clean — your project was never in it.</text>
+
+    <!-- 6 -->
+    <rect x="790" y="244" width="356" height="212" rx="16" fill="#101a30" stroke="#22304d" stroke-width="1.4"/>
+    <rect x="790" y="244" width="356" height="4" rx="2" fill="url(#s2)"/>
+    <g transform="translate(818,274)">
+      <rect x="0" y="0" width="44" height="44" rx="12" fill="#7b5cff" fill-opacity="0.14" stroke="#7b5cff" stroke-opacity="0.5"/>
+      <path d="M13 31 l9 -9" stroke="#b9a8ff" stroke-width="2" stroke-linecap="round"/>
+      <path d="M25 13 l6 6 -13 13 -8 2 2 -8 z" fill="none" stroke="#b9a8ff" stroke-width="2" stroke-linejoin="round"/>
+    </g>
+    <text x="818" y="352" class="h">Lives beside what you already have</text>
+    <text x="818" y="378" class="b">An existing DeepSeek Harness install keeps</text>
+    <text x="818" y="400" class="b">working. The container carries its own home</text>
+    <text x="818" y="422" class="b">directory and never reaches across.</text>
+  </g>
+</svg>
