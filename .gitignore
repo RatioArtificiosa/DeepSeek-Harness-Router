@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────
+# DeepSeek Harness Router — repository ignore rules
+# ─────────────────────────────────────────────────────────────────────
+
+# Local environment: contains absolute paths from THIS machine. Never commit.
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ── PRIVATE INSTALLER ────────────────────────────────────────────────
+# The owner's personal installer is deliberately NOT part of this repo.
+# See PROPOSAL.md §P-44.3.
+installer/
+*.local.md
+*.local.ps1
+*.local.sh
+router-image.tar
+router-image.tar.gz
+checksums.local.txt
+
+# Runtime state
+/data/
+/workspace/
+*.log
+logs/
+
+# Rust
+target/
+**/target/
+Cargo.lock.bak
+
+# Node (build tooling only; the runtime never needs it on the host)
+node_modules/
+**/node_modules/
+.pnpm-store/
+
+# Editors & OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+dist/
+build/
+*.tar
+*.tar.gz
