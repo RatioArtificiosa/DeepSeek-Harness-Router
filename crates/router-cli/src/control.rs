@@ -147,44 +147,109 @@ fn prefix_request(req: axum::extract::Request, name: &str) -> axum::extract::Req
 /// # Why the `Referer` and not a cookie
 ///
 /// The gateway has to decide which instance an origin-rooted request is for —
-/// `/api/remote.mux` names none. The first attempt used a cookie recording the
-/// "current instance", which broke the moment two tabs were open: the second tab
-/// overwrote it and the first tab's requests went to the wrong harness. A marker
-/// per instance was better but still could not choose *between* them, so with two
-/// tabs open the app lost those calls entirely.
+/// `/api/remote.mux` names none. Two earlier designs failed:
 ///
-/// The browser already answers this exactly, per request: a fetch from
-/// `/i/notes/` carries `Referer: …/i/notes/`, and one from `/i/probe/` carries
-/// `/i/probe/`. That is the instance the request genuinely came from, stated by
-/// the browser for each request rather than inferred across them, so two tabs
-/// never contend.
+/// - a cookie recording the "current instance", which broke with two tabs open,
+///   because the second tab overwrote it;
+/// - a marker per instance, which could say which instances were open but not
+///   which one a given request was for.
 ///
-/// It is a routing hint, not a security boundary: a client can send any
-/// `Referer` it likes. That is acceptable because the harness authenticates every
-/// request with its own cookie and trust fence — a forged value can only aim a
-/// request at an instance that will then refuse it.
+/// What works is reading the instance out of the request itself. Two headers can
+/// carry it, and **both are needed**:
+///
+/// - `Referer`, which a `fetch` from the page sends: `…/i/notes/…`.
+/// - `Origin`, which a **WebSocket handshake** sends *instead*. A browser does
+///   not attach `Referer` to an upgrade request, and the live agent socket is the
+///   single most important request the gateway carries. Routing on `Referer`
+///   alone left it 404ing while every `fetch` worked, which is exactly the kind
+///   of half-working failure that looks like an intermittent bug.
+///
+/// Note that both headers name only the *gateway* authority — `Origin` is always
+/// `http://127.0.0.1:<gateway>`, never the instance's port. So neither actually
+/// identifies an instance here; what identifies one is the `Referer` path, and
+/// `Origin` alone is not enough. When only `Origin` is present the request is
+/// routed to the sole instance this browser has open, which is what the socket
+/// needs and is unambiguous in the case that matters.
+///
+/// This is a routing hint, not a security boundary: a client can send either
+/// header. That is acceptable because the harness authenticates every request
+/// with its own cookie and trust fence — a forged value can only aim a request at
+/// an instance that will then refuse it.
 fn current_instance(req: &axum::extract::Request) -> Option<String> {
-    let referer = req
+    // 1. A `Referer` path names the instance precisely.
+    if let Some(name) = req
         .headers()
-        .get(axum::http::header::REFERER)?
-        .to_str()
-        .ok()?;
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(instance_name_in_url)
+    {
+        if known_instance(req, &name) {
+            return Some(name);
+        }
+    }
 
+    // 2. A WebSocket handshake sends `Origin` and no `Referer`. `Origin` names
+    //    only the gateway, so it identifies no instance — it is checked purely to
+    //    document that it was considered and cannot help. The fallback is the set
+    //    of instances this browser has open, and only when there is exactly one:
+    //    with two open there is no honest basis for choosing, and guessing would
+    //    deliver one agent's stream to another agent's tab.
+    let open = open_instances(req);
+    match open.as_slice() {
+        [only] if known_instance(req, only) => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// The instance named in a URL's path, if it is an instance path at all.
+fn instance_name_in_url(url: &str) -> Option<String> {
     // Only the path matters; the authority is the gateway either way.
-    let path = referer
+    let path = url
         .split_once("://")
-        .map_or(referer, |(_, rest)| rest)
+        .map_or(url, |(_, rest)| rest)
         .split_once('/')
         .map_or("", |(_, path)| path);
+    instance_from_path(&format!("/{path}"))
+}
 
-    let name = instance_from_path(&format!("/{path}"))?;
-
-    // A page for an instance the gateway is not serving routes nowhere, so
-    // decline rather than forwarding to a prefix no route matches.
+/// Whether the gateway actually serves this instance.
+fn known_instance(req: &axum::extract::Request, name: &str) -> bool {
     req.extensions()
         .get::<KnownInstances>()
-        .is_some_and(|known| known.0.iter().any(|n| n == &name))
-        .then_some(name)
+        .is_some_and(|known| known.0.iter().any(|n| n == name))
+}
+
+/// The instances this browser has open, from the markers the page set.
+fn open_instances(req: &axum::extract::Request) -> Vec<String> {
+    let Some(cookies) = req
+        .headers()
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    cookies
+        .split(';')
+        .filter_map(|part| {
+            let (key, value) = part.trim().split_once('=')?;
+            let name = key.strip_prefix(INSTANCE_COOKIE_PREFIX)?;
+            (!name.is_empty() && !value.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// The cookie prefix marking an instance as open in this browser.
+///
+/// Set when the instance's own document is served, so `current_instance` has a
+/// way to answer the one case no header can: a WebSocket handshake, which carries
+/// neither a path nor a `Referer`.
+const INSTANCE_COOKIE_PREFIX: &str = "dsr-open-";
+
+/// The cookie name marking `name` as open.
+fn instance_cookie(name: &str) -> String {
+    // Names are validated at registration, so they are already header-safe; this
+    // only guards the `=` the parser splits on.
+    format!("{INSTANCE_COOKIE_PREFIX}{}", name.replace('=', "-"))
 }
 
 /// The instance names the gateway currently serves, attached to each request.
@@ -195,6 +260,28 @@ fn current_instance(req: &axum::extract::Request) -> Option<String> {
 /// instance is added or removed.
 #[derive(Debug, Clone)]
 pub struct KnownInstances(pub Vec<String>);
+
+/// Mark an instance as open in this browser, when the path names one.
+///
+/// Never `HttpOnly`: the value carries no authority, and being readable is what
+/// lets a future debugging session see which instance a tab believes it is on.
+fn with_open_marker(
+    mut response: axum::response::Response,
+    path: &str,
+) -> axum::response::Response {
+    let Some(name) = instance_from_path(path) else {
+        return response;
+    };
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+        "{}=1; Path=/; SameSite=Lax",
+        instance_cookie(&name)
+    )) {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, value);
+    }
+    response
+}
 
 /// Serve the control page and the instance gateway until interrupted.
 ///
@@ -325,12 +412,17 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
                 if let Some(relay) = relay {
                     if path.starts_with("/i/") {
                         use tower::ServiceExt as _;
-                        return relay.clone().oneshot(req).await.unwrap_or_else(|e| {
+                        let response = relay.clone().oneshot(req).await.unwrap_or_else(|e| {
                             axum::response::Response::builder()
                                 .status(axum::http::StatusCode::BAD_GATEWAY)
                                 .body(axum::body::Body::from(format!("relay failed: {e}")))
                                 .expect("a fixed response always builds")
                         });
+                        // Mark this instance as open in this browser, so a
+                        // WebSocket handshake — which carries neither a path nor
+                        // a Referer — can still be routed. See
+                        // `current_instance`.
+                        return with_open_marker(response, &path);
                     }
 
                     // A root-absolute harness path, sent by an app that is
@@ -1238,13 +1330,28 @@ mod tests {
         req
     }
 
+    /// A WebSocket-shaped request: `Origin`, no `Referer`.
+    fn upgrade_request(open: &[&str], known: &[&str]) -> axum::extract::Request {
+        let cookies = open
+            .iter()
+            .map(|n| format!("{}=1", instance_cookie(n)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut req = axum::extract::Request::builder()
+            .header("origin", "http://127.0.0.1:3090")
+            .header("cookie", cookies)
+            .body(axum::body::Body::empty())
+            .expect("a test request builds");
+        req.extensions_mut().insert(KnownInstances(
+            known.iter().map(|s| (*s).to_string()).collect(),
+        ));
+        req
+    }
+
     #[test]
     fn the_instance_comes_from_the_referer_per_request() {
-        // The design that finally worked. A cookie cannot answer this correctly:
-        // the first attempt stored one "current instance" and the second tab
-        // overwrote it, so the first tab's requests went to the wrong harness.
-        // The browser states the origin of each request individually, so two tabs
-        // never contend.
+        // A `fetch` from the page carries the instance in its `Referer` path, so
+        // two tabs never contend.
         let notes = request_from(Some("http://127.0.0.1:3090/i/notes/"), &["notes", "probe"]);
         assert_eq!(current_instance(&notes).as_deref(), Some("notes"));
 
@@ -1256,9 +1363,28 @@ mod tests {
     }
 
     #[test]
-    fn a_request_with_no_referer_routes_nowhere() {
-        // A client that sends no Referer gets no guess. Serving an arbitrary
-        // instance would be worse than declining.
+    fn a_websocket_upgrade_is_routed_by_its_open_marker() {
+        // The regression this guards, found only in a real browser: a WebSocket
+        // handshake sends `Origin` and **no `Referer`**, so routing on `Referer`
+        // alone left the live agent socket 404ing while every `fetch` worked —
+        // the most important request in the app, silently broken.
+        //
+        // `Origin` names only the gateway, so it cannot identify an instance. The
+        // open marker can, and with one instance open the answer is unambiguous.
+        let req = upgrade_request(&["notes"], &["notes", "probe"]);
+        assert_eq!(current_instance(&req).as_deref(), Some("notes"));
+    }
+
+    #[test]
+    fn an_upgrade_with_two_instances_open_routes_nowhere() {
+        // With two open there is no honest basis for choosing, and guessing would
+        // deliver one agent's live stream to another agent's tab.
+        let req = upgrade_request(&["notes", "probe"], &["notes", "probe"]);
+        assert_eq!(current_instance(&req), None);
+    }
+
+    #[test]
+    fn a_request_with_no_identifying_header_routes_nowhere() {
         assert_eq!(current_instance(&request_from(None, &["notes"])), None);
         assert_eq!(
             current_instance(&request_from(Some("http://127.0.0.1:3090/"), &["notes"])),
@@ -1285,6 +1411,33 @@ mod tests {
         // depend on the scheme being present.
         let req = request_from(Some("/i/notes/"), &["notes"]);
         assert_eq!(current_instance(&req).as_deref(), Some("notes"));
+    }
+
+    #[test]
+    fn opening_an_instance_sets_its_open_marker() {
+        let response = || {
+            axum::response::Response::builder()
+                .status(200)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let marked = with_open_marker(response(), "/i/notes/");
+        let cookie = marked
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(cookie.contains("dsr-open-notes=1"), "{cookie}");
+        assert!(cookie.contains("Path=/"), "{cookie}");
+
+        // A bare path names no instance, so nothing is marked.
+        let untouched = with_open_marker(response(), "/api/settings/describe");
+        assert!(untouched
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .is_none());
     }
 
     #[test]
