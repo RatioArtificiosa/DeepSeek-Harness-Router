@@ -1,6 +1,6 @@
 # DeepSeek Harness Router — Architecture Proposal
 
-> **Status:** Draft for review · **Version:** 1.1.0
+> **Status:** Current design · **Version:** 2.0.0
 > **Repository:** <https://github.com/RatioArtificiosa/DeepSeek-Harness-Router>
 > **Source document:** [`docs/research/source-conversation.md`](./docs/research/source-conversation.md)
 > **Companion document:** [`CHECKLIST.md`](./CHECKLIST.md)
@@ -14,10 +14,7 @@
 | **1.0.0** | Initial proposal against the original repository |
 | **1.1.0** | **Repository changed** to `DeepSeek-Harness-Router` (§P-41); **Rust chosen** as the Router core language (§P-42); **Docker-first development workflow** formalized (§P-43); **private installer** requirement added (§P-44); README elevated to a primary deliverable (§P-45) |
 | **1.2.0** | **M4 UI decision resolved** to a DSH client plugin on ecosystem evidence (§P-46); **vision/image input** documented, including that DeepSeek-V4.1-Flash is already image-capable on the official route (§P-47) |
-
----
-
-| **2.0.0** | **The product was misunderstood and is restated.** This is not a Docker distribution for the public. It is a **local multi-instance router** that runs several DeepSeek Harness instances on one machine, each on its own port, workspace, and model. Docker is a **build-time laboratory**, not the delivery mechanism. |
+| **2.0.0** | **The product was restated.** This is not a Docker distribution for other people's computers. It is a **local multi-instance router** that runs several DeepSeek Harness instances on one machine, each on its own port, workspace, and model. Docker is a **build-time laboratory**, not the delivery mechanism |
 
 ---
 
@@ -27,13 +24,14 @@
 > a superseded premise: a publicly-distributed Docker package. They are retained
 > because they contain verified research about the harness — the storage and
 > session survey, the sandbox probes, the streaming-proof tests — that the
-> current design still relies on.
+> current design still builds on.
 >
 > **Where an old section conflicts with §P-48 onward, §P-48 onward wins.**
 > §P-53.2 names exactly which old conclusions are retired, so no reader mistakes
 > a superseded conclusion for a current one.
 
 ---
+
 ## How to read this document
 
 Every checklist item in `CHECKLIST.md` carries a reference of the form **→ §P-XX.Y**. That reference points at a numbered section of *this* document. Before executing any checklist line, read the referenced section: it contains the rationale, the constraints, the exact commands, and the acceptance criteria for that line.
@@ -42,14 +40,15 @@ This document is deliberately long. It is a build specification, not a summary. 
 
 ### Document map
 
-| Part | Sections | Purpose |
+| Part | Sections | Status |
 |---|---|---|
-| **I — Foundation** | §P-01 … §P-06 | Mission, constraints, discoveries, decisions |
-| **II — Architecture** | §P-07 … §P-16 | System design, DSH integration, data model |
-| **III — Security** | §P-17 … §P-21 | Threat model, sandboxing, approval model |
-| **IV — Delivery** | §P-22 … §P-30 | Docker, launchers, UX, CI, operations |
-| **V — Execution** | §P-31 … §P-40 | Roadmap, risks, QA, definition of done |
-| **VI — Decisions of record** | §P-41 … §P-47 | Repository, language, workflow, installer, README, M4 UI, vision |
+| **I — Foundation** | §P-01 … §P-06 | Premise superseded; research findings still valid |
+| **II — Architecture** | §P-07 … §P-16 | Container-specific; retained for reference |
+| **III — Security** | §P-17 … §P-21 | Harness findings valid; container specifics retired |
+| **IV — Delivery** | §P-22 … §P-30 | **Superseded** by §P-50 … §P-52 |
+| **V — Execution** | §P-31 … §P-40 | Superseded by §P-55 |
+| **VI — Decisions of record** | §P-41 … §P-47 | Repository, Rust, and vision decisions stand |
+| **VII — The real product** | **§P-48 … §P-55** | ✅ **Current design** |
 
 ---
 
