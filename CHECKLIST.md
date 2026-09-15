@@ -353,13 +353,15 @@ Before executing any line, re-read these. They are absolute.
 
 > Gated behind M3. **Do not start before the DoD passes.**
 
+> **Approach resolved (§P-46):** a DSH **client plugin**. The shell-application fallback is dropped.
+
 → §P-31.6 · Anti-goal: §P-27.1
 
 | # | Item | Reference |
 |---|---|---|
 | `[ ]` | **CT-05-01** Re-read the anti-goal: **do not rebuild the DSH chat UI** | → §P-27.1 |
-| `[ ]` | **CT-05-02** Decide client-plugin vs shell-application approach, against the **currently pinned** DSH version | → §P-27.3 |
-| `[ ]` | **CT-05-03** Record that decision as an ADR with its trade-off | → §P-27.3 |
+| `[ ]` | **CT-05-02** **[RESOLVED]** Approach adopted: a DSH **client plugin** (§P-46). No further decision needed | → §P-46.3 |
+| `[ ]` | **CT-05-03** Record the client-plugin decision as an ADR, citing the ecosystem evidence | → §P-46.2 |
 | `[ ]` | **CT-05-04** Build the first-run onboarding flow (workspace + model) | → §P-27.4 |
 | `[ ]` | **CT-05-05** Render the "what the agent can reach" trust-boundary block | → §P-27.4 |
 | `[ ]` | **CT-05-06** Build the environment panel sourced from `/health` | → §P-27.2 |
@@ -370,6 +372,30 @@ Before executing any line, re-read these. They are absolute.
 | `[ ]` | **CT-05-11** Show session/disk usage with a safe prune action | → §P-27.2 |
 | `[ ]` | **CT-05-12** Verify a new user reaches a working session unaided | → §P-31.6 exit |
 | `[ ]` | **CT-05-13** Audit against the rejected UX anti-patterns | → §P-27.5 |
+
+## CT-05.B — Vision and image input
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-05-14** Confirm the official route needs **no** configuration — `deepseek-flash` already declares `inputModalities: ["text","image"]` | → §P-47.1 |
+| `[ ]` | **CT-05-15** Document the gateway recipe: the one-line `input: [text, image]` per model | → §P-47.2 |
+| `[ ]` | **CT-05-16** Document the route-level alternative: `defaultInput: [text, image]` | → §P-47.2 |
+| `[ ]` | **CT-05-17** Document the built-in-provider form: `modelOverrides.<id>.input` | → §P-47.3 |
+| `[ ]` | **CT-05-18** Document the fallback trap: `defaultInput` never **narrows** a catalog model | → §P-47.3 |
+| `[ ]` | **CT-05-19** Seed the first-run settings template with the vision line for a custom route | → §P-47.4 |
+| `[ ]` | **CT-05-20** Report per-model modality in `/health` so refusal is visible before an image is attached | → §P-47.4 |
+| `[ ]` | **CT-05-21** Surface the modality setting in the Environment panel (the Models form has no field for it) | → §P-47.5 |
+| `[ ]` | **CT-05-22** Verify an attached image is accepted end-to-end on the official route | → §P-47.1 |
+
+## CT-05.C — Client plugin build (per §P-46)
+
+| # | Item | Reference |
+|---|---|---|
+| `[ ]` | **CT-05-23** Create the client plugin package with a `dsh.client` manifest, `platform: 'web'` | → §P-46.2 |
+| `[ ]` | **CT-05-24** Export the `./client` bundle and confirm it builds to `lib/client.js` | → §P-46.4 |
+| `[ ]` | **CT-05-25** Restrict imports to the frozen `PLATFORM_MODULES` baseline plus `dsh.client.external` declarations | → §P-46.4 |
+| `[ ]` | **CT-05-26** Confirm the image build produces the plugin bundle before launch | → §P-46.4 |
+| `[ ]` | **CT-05-27** Confirm a client-API break is contained to this package, not the core | → §P-46.4 |
 
 ---
 

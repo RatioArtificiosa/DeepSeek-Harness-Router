@@ -13,6 +13,7 @@
 |---|---|
 | **1.0.0** | Initial proposal against the original repository |
 | **1.1.0** | **Repository changed** to `DeepSeek-Harness-Router` (§P-41); **Rust chosen** as the Router core language (§P-42); **Docker-first development workflow** formalized (§P-43); **private installer** requirement added (§P-44); README elevated to a primary deliverable (§P-45) |
+| **1.2.0** | **M4 UI decision resolved** to a DSH client plugin on ecosystem evidence (§P-46); **vision/image input** documented, including that DeepSeek-V4.1-Flash is already image-capable on the official route (§P-47) |
 
 ---
 
@@ -31,7 +32,7 @@ This document is deliberately long. It is a build specification, not a summary. 
 | **III — Security** | §P-17 … §P-21 | Threat model, sandboxing, approval model |
 | **IV — Delivery** | §P-22 … §P-30 | Docker, launchers, UX, CI, operations |
 | **V — Execution** | §P-31 … §P-40 | Roadmap, risks, QA, definition of done |
-| **VI — Decisions of record** | §P-41 … §P-45 | Repository, language, workflow, installer, README |
+| **VI — Decisions of record** | §P-41 … §P-47 | Repository, language, workflow, installer, README, M4 UI, vision |
 
 ---
 
@@ -2672,7 +2673,7 @@ DSH is **everything-is-a-plugin** with a documented client plugin system (`dsh.c
 | **A — Client plugin** | Install a `dsh` client plugin into the container's `web` profile; it registers into DSH's slot system and renders inside the real GUI | **Native integration**; must track DSH's plugin API across preview releases |
 | **B — Shell application** | Our own React app wraps/iframes or proxies DSH's UI and adds a control shell around it | **Decoupled** from DSH internals; less deep integration |
 
-**Recommendation: A, with B as the fallback.**
+**Recommendation: A, with B as the fallback.** — **RESOLVED in §P-46: approach A (client plugin) is adopted; the fallback is dropped.**
 
 - **A is correct** because it inherits the entire DSH UI rather than duplicating it, and DSH's plugin surface is a documented, first-class extension point.
 - **B is the safety net** if the client plugin API proves too unstable during the preview period.
@@ -3996,3 +3997,211 @@ The README is verified against reality in CI:
 - **Screenshots and diagrams are regenerated whenever the CLI output they depict changes** — a stale hero image is worse than none.
 
 > **A README that overclaims is a bug**, not a marketing choice. The project's credibility rests on a reader being able to reproduce, in one command, exactly what the top of the page promised.
+
+---
+
+## §P-46 — Decision of record: the M4 UI approach (resolved)
+
+### §P-46.1 What was open
+
+§P-27.3 recorded an open question: whether the Router's UI additions would be a
+**DSH client plugin** or a **separate shell application**. The reasoning for
+leaving it open was that DSH's plugin API was in developer preview and might move.
+
+### §P-46.2 What the research found
+
+The question is now resolved, and the evidence is stronger than expected.
+
+**Finding 1 — the client plugin system is a documented, first-class extension point.**
+
+`dsh-client-modules` defines the mechanism precisely: a package declares
+`dsh.client` in its `package.json` with `platform: 'web'`, exports a `./client`
+bundle, and the host composes and serves it. The loader is described as the
+*single replacement* for "how plugin code arrives", using a frozen
+`PLATFORM_MODULES` baseline (React, Cordis, and static UI libraries) so a plugin's
+externals resolve against a known table.
+
+**Finding 2 — the ecosystem is real, large, and standardised.**
+
+The GitHub topic `dsh-plugin` lists **15,044 public repositories**. A curated
+index (`awesome-dsh-plugin`) documents the install path — `dsh plugin add`, each
+plugin declaring a `dsh.bundle` manifest — and organises plugins into
+well-populated categories: UI Enhancements, Sessions & Messages, Themes,
+Providers, Tools, Security & Permissions, and more.
+
+**Finding 3 — UI plugins of exactly the kind we planned already exist and work.**
+
+Concrete published examples that overlap our §P-27.2 feature list:
+
+| Our planned addition | Existing plugin evidence |
+|---|---|
+| Environment/status panel | HUD panels showing git status, model, and token usage |
+| Version display | An "About" settings page showing the running DSH version |
+| Layout/panel control | Dockable layouts, resizable panels, docked sidebars |
+| Command palette | A keyboard-first command palette |
+| Session/task views | Task boards, session navigators, conversation maps |
+| Settings surfaces | Multiple plugins adding settings pages |
+
+This is decisive: the client plugin surface is **not** experimental folklore. It is
+a working, widely-used protocol with a large install base.
+
+### §P-46.3 The decision
+
+> **M4 uses a DSH client plugin. The shell-application fallback is dropped.**
+
+| Factor | Assessment |
+|---|---|
+| **Protocol maturity** | Documented manifest, stable baseline module table, HMR support |
+| **Ecosystem risk** | Low — thousands of plugins depend on this surface, so upstream has strong incentives to keep it stable |
+| **Inheritance** | We inherit the entire DSH UI rather than duplicating it (anti-goal §P-27.1 preserved) |
+| **Bundle cost** | A plugin adds only what it renders; the shared React baseline is already present |
+| **Reversibility** | If the surface broke, the plugin is a separate package — replaceable without touching the core |
+
+### §P-46.4 Consequences for the build
+
+| Consequence | Detail |
+|---|---|
+| **A new deliverable** | A TypeScript client plugin package, built in the same image and mounted into the container's `web` profile |
+| **Build coupling** | The plugin needs `pnpm run build` to have produced `lib/client.js`; the image build must therefore include it |
+| **Toolchain boundary sharpened** | Rust owns the core; **TypeScript owns the UI plugin** — this is now a firm boundary, not a placeholder |
+| **Baseline discipline** | The plugin may only import from the frozen `PLATFORM_MODULES` table plus whatever it declares in `dsh.client.external` |
+| **Version risk localised** | The plugin pins against the DSH version (§P-15); a breaking client-API change is a plugin-layer fix, not a core rewrite |
+
+### §P-46.5 What this changes in the plan
+
+| Document | Change |
+|---|---|
+| §P-27.3 | The open decision is **closed** — recommendation A is adopted |
+| §P-42.6 | The TypeScript row for the UI is confirmed rather than provisional |
+| §P-08.1 | A new package directory is added for the client plugin |
+| Checklist CT-05 | The "decide the approach" item becomes "build the client plugin" |
+
+> **Why this is worth recording rather than silently adopting:** the original
+> caution was reasonable, and the reason it is now resolved is **evidence** — a
+> documented protocol plus 15,044 dependent repositories. Recording the evidence
+> means the decision can be re-examined if that evidence changes.
+
+---
+
+## §P-47 — Vision and image input
+
+### §P-47.1 The finding
+
+DeepSeek Harness supports image input, and **DeepSeek-V4.1-Flash is already
+image-capable on the official route**.
+
+Verified against the installed package's shipped catalog
+(`dsh-llm-deepseek`):
+
+```js
+{
+  id: "deepseek-flash",
+  name: "DeepSeek-V41-Flash",
+  contextWindow: DEFAULT_CONTEXT_WINDOW,
+  inputModalities: ["text", "image"],   // <-- vision, out of the box
+  imagePixelBudget: DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET,
+  imageMaxBytes: DEFAULT_REQUEST_IMAGE_MAX_BYTES,
+  systemPromptUpdate: "in-history"
+}
+```
+
+A second vision entry ships alongside it: `deepseek-v4-flash-vision-exp`
+(`DeepSeek-V4-Flash-Vision-Exp`).
+
+**Consequence:** on the **official DeepSeek route**, there is nothing to
+configure. Attach an image and it works.
+
+### §P-47.2 Where configuration *is* required — the "two lines"
+
+Image input is refused for a model that does not declare the modality. The
+official documentation is explicit:
+
+> *"A model you enter by hand is treated as text-only until it says otherwise,
+> because nothing can ask an endpoint which modalities it accepts. Attaching an
+> image to such a model is refused before it is sent, naming the model.*
+>
+> *A vision model on a custom provider therefore needs one line."*
+
+So for a **custom or gateway route** (§P-13.5 — OpenAI-compatible or
+Anthropic-compatible), a model is text-only until told otherwise. Two forms,
+each essentially one line:
+
+**Per model:**
+```yaml
+llm-pi-ai:
+  providers:
+    my-gateway:
+      apiKeyEnv: GATEWAY_API_KEY
+      api: openai-completions
+      baseURL: https://gateway.example/v1
+      models:
+        - id: legacy-chat
+        - id: vision-preview
+          input: [text, image]        # <-- the one line
+```
+
+**Per route** (when every model on it takes images):
+```yaml
+llm-pi-ai:
+  providers:
+    vision-gateway:
+      apiKeyEnv: GATEWAY_API_KEY
+      api: openai-completions
+      baseURL: https://vision.example/v1
+      defaultInput: [text, image]     # <-- the one line
+      models:
+        - id: first-model
+        - id: second-model
+```
+
+For a **built-in** provider, the same narrowing/widening is expressed under
+`modelOverrides`, keyed by model id.
+
+### §P-47.3 The exact field semantics
+
+Confirmed from the adapter source, because the subtlety matters:
+
+| Field | Scope | Semantics |
+|---|---|---|
+| `input` | one model | **Override.** Declares that model's modalities. An empty list means the same as omitting it |
+| `defaultInput` | one route | **Fallback, not override.** Answers only for models the installed catalog does not describe; it **never narrows** a catalog model that already declares images |
+| `modelOverrides.<id>.input` | built-in provider | The way to adjust a catalog-served model |
+
+> **The trap worth documenting:** `defaultInput` is a fallback. Someone who
+> expects it to override a catalog entry will find images still refused — because
+> the catalog's declaration wins. Use the model's own `input`, or
+> `modelOverrides`, to narrow a catalog model.
+
+**Two more documented behaviours:**
+
+1. **These are claims, not checks.** Declaring `image` on an endpoint that does
+   not serve it is not caught at configuration time — the provider rejects the
+   request instead.
+2. **An unknown modality is refused wherever written**, and every list must name
+   at least one modality except a model's own `input`.
+
+### §P-47.4 What this means for the Router
+
+| Item | Consequence |
+|---|---|
+| **Nothing to build for the happy path** | On the official route, vision works without configuration |
+| **A documented recipe for gateway users** | The gateway case gets a short, tested snippet in the docs |
+| **Two lines in the seeded settings template** | The Router's first-run template can pre-declare vision for a custom route, so users do not discover it by failure |
+| **A settings-page gap we can close** | The Models form has **no field** for `input`; that is exactly the kind of environment-transparency gap §P-27.2 exists to fill |
+| **Health-check opportunity** | `/health` can report per-model modality, so a user sees "images: allowed / refused" before attaching one |
+
+### §P-47.5 A UI opportunity this creates
+
+The DSH Models page deliberately exposes only what a route needs to exist. Image
+modality, reasoning levels, and compatibility switches are `settings.yaml`-only.
+
+The ecosystem already works around this — published plugins add image pickers,
+paste rails, and drag-and-drop attachment into the composer's official pipeline.
+
+**Our opportunity:** rather than build another attachment UI, expose the
+**modality configuration** our Environment panel already has a home for. A user
+who attaches an image and is refused should be able to see *why* and fix it in
+one place, instead of editing YAML.
+
+That is a §P-27.2 environment-transparency feature, not a new subsystem — which
+keeps the anti-goal of §P-27.1 intact.

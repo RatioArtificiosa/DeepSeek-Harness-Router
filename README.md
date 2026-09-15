@@ -10,15 +10,32 @@ A self-hosted workspace for the DeepSeek Harness agent — packaged so you can s
 working in minutes, point it at a real project, and know exactly what it can touch.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-4f8cff.svg?style=flat-square)](LICENSE)
-[![Built with Rust](https://img.shields.io/badge/core-Rust-f74c00.svg?style=flat-square&logo=rust&logoColor=white)](crates)
-[![Runtime: Docker](https://img.shields.io/badge/runtime-Docker-2496ED.svg?style=flat-square&logo=docker&logoColor=white)](docker-compose.yml)
+[![Built with Rust](https://img.shields.io/badge/core-Rust-f74c00.svg?style=flat-square&logo=rust&logoColor=white)](PROPOSAL.md#p-42--language-decision-rust-for-the-router-core)
+[![Runtime: Docker](https://img.shields.io/badge/runtime-Docker-2496ED.svg?style=flat-square&logo=docker&logoColor=white)](PROPOSAL.md#p-23--docker-compose)
 [![Harness](https://img.shields.io/badge/harness-0.1.5--rc.1-37e0c8.svg?style=flat-square)](docs/dsh-compatibility.md)
+[![Status: in development](https://img.shields.io/badge/status-in%20development-ffce6a.svg?style=flat-square)](#-project-status)
 
 <br>
 
 [**Quick start**](#quick-start) · [**Why**](#why-this-exists) · [**Features**](#what-you-can-do) · [**Security**](#what-it-can-and-cannot-touch) · [**FAQ**](#questions-people-actually-ask)
 
 </div>
+
+---
+
+> ### Project status
+>
+> **This project is under active development and does not run yet.**
+>
+> The architecture, security model, and execution plan are complete and reviewed —
+> see [`PROPOSAL.md`](PROPOSAL.md) and [`CHECKLIST.md`](CHECKLIST.md). The Rust core,
+> the container image, and the launchers are being built now.
+>
+> Everything below describes what the finished system does. If you want to follow
+> along or contribute, the checklist is the map: it is ordered, and every line
+> cites the design section it implements.
+>
+> **Star the repository** to be notified when the first working release lands.
 
 ---
 
@@ -201,7 +218,7 @@ process boundary, so the agent runtime stays exactly as upstream ships it.
 
 **The harness stays the harness.** We do not fork it, patch it, or vendor it. We
 pin an exact version and run it. When upstream moves, the coupling is confined to
-one crate — [`crates/router-dsh`](crates/router-dsh) — rather than smeared across
+one crate — [`crates/router-dsh`](PROPOSAL.md#p-424-the-resulting-boundary) — rather than smeared across
 the codebase.
 
 <details>
