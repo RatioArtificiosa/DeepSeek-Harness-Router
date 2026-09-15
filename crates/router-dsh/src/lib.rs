@@ -8,8 +8,7 @@
 //! **This is the only crate permitted to know how the harness works.** No other
 //! crate may encode harness-specific behaviour, because the harness is in
 //! developer preview and breaking changes are expected. Confining that coupling
-//! here is what makes an upstream change a localized edit rather than a rewrite
-//! (which keeps an upstream change a localized edit).
+//! here is what keeps an upstream change a localized edit rather than a rewrite.
 //!
 //! ```
 //! use router_dsh::readiness::{classify_line, OutputSignal};
@@ -26,10 +25,14 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod multi;
+pub mod provisioning;
 pub mod readiness;
 pub mod state;
 pub mod supervisor;
 
+pub use multi::{InstanceError, InstanceSpec, MultiConfig, MultiSupervisor};
+pub use provisioning::{provision, settings_document, split_model, ProvisionReport};
 pub use readiness::{classify_line, OutputSignal};
 pub use state::{RuntimeFailure, RuntimeState, RuntimeStatus};
 pub use supervisor::{Supervisor, SupervisorConfig};
