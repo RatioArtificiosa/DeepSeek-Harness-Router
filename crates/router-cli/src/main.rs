@@ -859,6 +859,23 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
         let mut stopped = 0usize;
         for n in registry.names() {
             let instance = registry.get(n).expect("name came from the registry");
+
+            // The same ownership check as the single-instance path. `--all` is
+            // the case where it matters most: it visits every port, so without
+            // this it is the quickest way to kill several unrelated harnesses at
+            // once.
+            if serving_state(&home.instance_dir(n), instance.port) == Serving::Foreign {
+                failures.push((
+                    n.to_string(),
+                    StopFailure::Foreign {
+                        pids: Vec::new(),
+                        commands: Vec::new(),
+                    },
+                    instance.port,
+                ));
+                continue;
+            }
+
             // By port, not by child handle: this process did not start the
             // harness. See `stop_instance`.
             match stop_instance(instance.port).await {
@@ -867,6 +884,7 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
                     // no longer usable. Leaving it would let `open` offer a
                     // link that cannot work.
                     router_dsh::browser::clear(&home.instance_dir(n));
+                    router_dsh::browser::clear_pid(&home.instance_dir(n));
                     stopped += 1;
                 }
                 Err(reason) => failures.push((n.to_string(), reason, instance.port)),
@@ -907,6 +925,37 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
     }
     let instance = registry.get(name).expect("checked above");
 
+    // Own before stopping, and refuse if ownership cannot be proved.
+    //
+    // # The bug this fixes
+    //
+    // `stop_listener_on` guards itself with `looks_like_our_harness`, which
+    // answers "is this a harness?" — not "is this *our* harness?". Every harness
+    // on the machine has the same shape of command line, since the state root
+    // travels in `DSH_HOME` and one process's environment cannot be read from
+    // another. So a harness started outside the router passed the check, and
+    // `router stop main` killed it.
+    //
+    // That was observed, not theorised: a watchdog script's harness on an
+    // instance port was killed by `router stop`. It came back, because the script
+    // restarted it, but the router had destroyed a process it did not own — the
+    // one thing this project promises never to do.
+    //
+    // Ownership means the PID this router recorded at start still holds the port.
+    // Anything else is somebody else's process, and the answer is to leave it
+    // alone and say so.
+    let state = serving_state(&home.instance_dir(name), instance.port);
+    if state == Serving::Foreign {
+        return Err(stop_failure(
+            name,
+            &StopFailure::Foreign {
+                pids: Vec::new(),
+                commands: Vec::new(),
+            },
+            instance.port,
+        ));
+    }
+
     if let Err(reason) = stop_instance(instance.port).await {
         // Reporting success here would be the worst outcome: the user stops
         // looking while the harness keeps the port, and the next start fails
@@ -914,8 +963,10 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
         return Err(stop_failure(name, &reason, instance.port));
     }
 
-    // The token died with the process.
+    // The token died with the process, and so did the recorded PID's claim on
+    // the port.
     router_dsh::browser::clear(&home.instance_dir(name));
+    router_dsh::browser::clear_pid(&home.instance_dir(name));
 
     if style.verbosity != Verbosity::Quiet {
         term::out(&style.ok(&format!("Stopped {}", style.strong(name))));
@@ -1004,15 +1055,26 @@ impl StopFailure {
     fn describe(&self, port: u16) -> String {
         match self {
             Self::Foreign { pids, commands } => {
-                let who = commands
-                    .iter()
-                    .zip(pids.iter())
-                    .map(|(c, p)| format!("pid {p}: {c}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!(
-                    "port {port} is held by something that is not this router's harness:\n{who}"
-                )
+                // `pids` is empty when the refusal came from the ownership check
+                // rather than from a kill attempt: we know the port is not ours
+                // without necessarily having identified the holder. Building the
+                // "pid N: cmd" list unconditionally left a trailing newline and a
+                // blank line under the message.
+                if pids.is_empty() {
+                    let who = router_dsh::process::describe_listener(port)
+                        .unwrap_or_else(|| "another process".to_string());
+                    format!("port {port} is held by {who}, which this router did not start")
+                } else {
+                    let who = commands
+                        .iter()
+                        .zip(pids.iter())
+                        .map(|(c, p)| format!("pid {p}: {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "port {port} is held by something that is not this router's harness:\n{who}"
+                    )
+                }
             }
             Self::StillListening { port } => {
                 format!("something is still listening on port {port}")
@@ -1415,24 +1477,28 @@ async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failur
         .cloned()
         .ok_or_else(|| unknown_instance(name, &registry))?;
 
-    // An instance that is serving must be stopped before it is forgotten.
-    //
-    // Removing the registry entry alone left the harness running with nothing
-    // pointing at it: an agent still holding the port, still holding its
-    // credentials, and unreachable through `router` — no name to stop, no name
-    // to show in `list`. The user believed it was gone.
-    let serving = probe_port(instance.port);
+    // Only stop it when it is genuinely ours. Asking `stop_instance` whenever the
+    // port answers is what killed a harness the router did not own: its internal
+    // check asks "is this a harness?", and every harness on the machine answers
+    // yes, because the state root travels in `DSH_HOME` and cannot be read from
+    // another process.
+    let serving = serving_state(&home.instance_dir(name), instance.port);
 
     if !yes {
         // Say plainly what will and will not happen. The reassurance is the
         // important half: people hesitate before a destructive-looking command,
         // and rightly so.
         term::out(&format!("  Remove instance {}?", style.strong(name)));
-        if serving {
-            term::out(&style.warn(&format!(
+        match serving {
+            Serving::Ours => term::out(&style.warn(&format!(
                 "    It is SERVING on port {} and will be stopped first.",
                 instance.port
-            )));
+            ))),
+            Serving::Foreign => term::out(&style.warn(&format!(
+                "    Port {} is held by another process. It will NOT be touched.",
+                instance.port
+            ))),
+            Serving::Down => {}
         }
         term::out(&style.dim(&format!(
             "    Its workspace {} is NOT touched.",
@@ -1463,8 +1529,8 @@ async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failur
     // with an instance they cannot remove because an unrelated program happens
     // to hold its port. The collision is reported, because it explains why the
     // port may be unusable later.
-    if serving {
-        match stop_instance(instance.port).await {
+    match serving {
+        Serving::Ours => match stop_instance(instance.port).await {
             Ok(()) => {
                 if style.verbosity != Verbosity::Quiet {
                     term::out(&style.dim(&format!("  Stopped {name} on port {}.", instance.port)));
@@ -1483,7 +1549,14 @@ async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failur
                 );
             }
             Err(ref reason) => return Err(stop_failure(name, reason, instance.port)),
+        },
+        Serving::Foreign => {
+            let who = router_dsh::process::describe_listener(instance.port)
+                .unwrap_or_else(|| "another process".to_string());
+            term::err(&style.warn(&format!("  Port {} is held by {who}.", instance.port)));
+            term::err(&style.dim("    It is not ours, so it was not stopped or touched."));
         }
+        Serving::Down => {}
     }
 
     // The removal itself is a read-modify-write like any other, so it takes the
@@ -1496,6 +1569,11 @@ async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failur
         }
         Ok(())
     })?;
+
+    // No instance, so no claim on a port. A leftover PID here would let a later
+    // `add` of the same name adopt whatever now holds that port.
+    router_dsh::browser::clear_pid(&home.instance_dir(name));
+    router_dsh::browser::clear(&home.instance_dir(name));
 
     if style.verbosity != Verbosity::Quiet {
         term::out(&style.ok(&format!("Removed {}", style.strong(name))));
@@ -2333,6 +2411,71 @@ mod tests {
 
         assert_eq!(serving_state(dir.path(), port), Serving::Foreign);
         drop(server);
+    }
+
+    #[test]
+    fn a_foreign_port_is_refused_rather_than_stopped() {
+        // The regression this guards, observed on a real machine: `router stop`
+        // killed a harness the router did not start.
+        //
+        // `stop_listener_on` guards itself with `looks_like_our_harness`, which
+        // answers "is this a harness?" and not "is this *our* harness?". Every
+        // harness on the machine has the same shape of command line — the state
+        // root travels in `DSH_HOME`, which cannot be read from another process —
+        // so a watchdog's harness passed that check and was killed.
+        //
+        // The decision now rests on proved ownership, which is exactly what
+        // `Serving::Foreign` means. This asserts the predicate `stop`, `stop
+        // --all` and `rm` all gate on, so a future refactor that drops the gate
+        // fails here rather than on somebody's machine.
+        let dir = tempfile::tempdir().unwrap();
+        let (port, server) = spawn_http_responder_local();
+
+        // No recorded PID, so ownership cannot be proved.
+        assert_eq!(serving_state(dir.path(), port), Serving::Foreign);
+        assert_ne!(
+            serving_state(dir.path(), port),
+            Serving::Ours,
+            "an unowned port must never be treated as ours — every destructive \
+             command gates on this"
+        );
+        drop(server);
+    }
+
+    /// A throwaway HTTP responder, for tests about port state.
+    fn spawn_http_responder_local() -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn a_foreign_refusal_explains_itself_without_blank_lines() {
+        // The message is what a user reads when the router declines to act. It
+        // previously ended in a newline followed by nothing, because the
+        // pid-and-command list was built unconditionally and was empty when the
+        // refusal came from the ownership check rather than a kill attempt.
+        let reason = StopFailure::Foreign {
+            pids: Vec::new(),
+            commands: Vec::new(),
+        };
+        let text = reason.describe(3082);
+        assert!(!text.ends_with('\n'), "trailing newline: {text:?}");
+        assert!(
+            !text.contains("\n\n"),
+            "blank line in the message: {text:?}"
+        );
+        assert!(text.contains("3082"), "the port must be named: {text}");
     }
 
     #[test]
