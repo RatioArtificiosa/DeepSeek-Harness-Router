@@ -79,7 +79,24 @@ pub async fn kill_tree(child: &mut Child, grace: std::time::Duration) {
     let _ = child.kill().await;
 }
 
-/// Find the process listening on a loopback port and stop it.
+/// Why a port could not be released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopRefusal {
+    /// Something is listening, but it is not this project's harness.
+    ///
+    /// Carries the process ids and their command lines, so the message can name
+    /// what is actually holding the port instead of leaving the user to guess.
+    NotOurs {
+        /// The offending process ids.
+        pids: Vec<u32>,
+        /// Their command lines, for display.
+        commands: Vec<String>,
+    },
+    /// The owner could not be determined at all.
+    Unknown,
+}
+
+/// Find the process listening on a loopback port and stop it, if it is ours.
 ///
 /// # Why this is needed at all
 ///
@@ -92,18 +109,69 @@ pub async fn kill_tree(child: &mut Child, grace: std::time::Duration) {
 /// harness kept the port. A command that reports work it did not do is worse
 /// than one that fails, because the user stops looking.
 ///
-/// So the port is the address of the process. It is the one fact both processes
-/// agree on, and the harness's whole purpose is to hold it.
+/// # Why identity is verified before killing
 ///
-/// Returns `true` when nothing is listening afterwards — which includes the case
-/// where nothing was listening to begin with, because "make it not run" is
+/// The port alone is **not** proof of ownership. An earlier revision killed
+/// whatever held the port, on the reasoning that the port is the one fact both
+/// processes agree on. It is — but agreement is not identity: any unrelated
+/// program that happened to bind that port was killed, and `router stop` still
+/// reported success. A user testing two things at once could lose an unrelated
+/// process with no warning and no way to know why.
+///
+/// So the listener is identified first. A process is ours when its command line
+/// shows this project's harness invocation. If it is not ours, nothing is
+/// killed and the caller is told what is holding the port.
+///
+/// Returns `Ok(true)` when nothing is listening afterwards — which includes the
+/// case where nothing was listening to begin with, because "make it not run" is
 /// already satisfied.
-pub async fn stop_listener_on(port: u16, grace: std::time::Duration) -> bool {
+///
+/// # Errors
+///
+/// Returns [`StopRefusal`] when the listener is not ours, or its owner cannot be
+/// determined. Both are refusals rather than failures to avoid killing the wrong
+/// thing.
+pub async fn stop_listener_on(port: u16, grace: std::time::Duration) -> Result<bool, StopRefusal> {
+    if !is_listening(port) {
+        return Ok(true);
+    }
+
     let Some(pids) = listeners_on(port) else {
-        // Could not determine the owner. Reporting a failure is right: claiming
-        // success here is the exact bug this function exists to fix.
-        return false;
+        // Could not determine the owner. Refusing is right: killing a process
+        // we cannot identify is exactly the hazard this check exists for.
+        return Err(StopRefusal::Unknown);
     };
+    if pids.is_empty() {
+        // A connect succeeded but no owning process was found — possible when
+        // another user's process holds the port, or the lookup raced. Refuse
+        // rather than guess.
+        return Err(StopRefusal::Unknown);
+    }
+
+    // Every listener must look like our harness. If any does not, nothing is
+    // killed: stopping some of them would leave a half-stopped state that is
+    // harder to reason about than refusing outright.
+    let mut foreign_pids = Vec::new();
+    let mut foreign_commands = Vec::new();
+    for pid in &pids {
+        match process_command_line(*pid) {
+            Some(cmd) if looks_like_our_harness(&cmd) => {}
+            Some(cmd) => {
+                foreign_pids.push(*pid);
+                foreign_commands.push(cmd);
+            }
+            None => {
+                foreign_pids.push(*pid);
+                foreign_commands.push("<command line unavailable>".to_string());
+            }
+        }
+    }
+    if !foreign_pids.is_empty() {
+        return Err(StopRefusal::NotOurs {
+            pids: foreign_pids,
+            commands: foreign_commands,
+        });
+    }
 
     for pid in pids {
         terminate_pid(pid, grace).await;
@@ -115,11 +183,85 @@ pub async fn stop_listener_on(port: u16, grace: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + grace.max(std::time::Duration::from_secs(5));
     while std::time::Instant::now() < deadline {
         if !is_listening(port) {
-            return true;
+            return Ok(true);
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
-    !is_listening(port)
+    Ok(!is_listening(port))
+}
+
+/// Whether a command line looks like a harness this router started.
+///
+/// Deliberately permissive about the path and strict about the shape: the
+/// binary may be `dsh`, `dsh.cmd`, `dsh.exe`, `node …/dsh/bin.js`, or a full
+/// path, and on Windows the actual listener is a `node` process whose command
+/// line contains the harness's script path. What must hold is that the line
+/// mentions a `dsh` executable or a path through the harness package — enough
+/// to distinguish it from an unrelated program that merely binds the right port.
+///
+/// This is a safety check, not authentication. It is not defending against a
+/// hostile process deliberately imitating the harness; it is preventing an
+/// accident, which is the realistic risk.
+#[must_use]
+pub fn looks_like_our_harness(command_line: &str) -> bool {
+    let lower = command_line.to_ascii_lowercase();
+
+    // The harness binary itself, with or without an extension.
+    if lower.contains("dsh ")
+        || lower.contains("dsh.exe")
+        || lower.contains("dsh.cmd")
+        || lower.ends_with("dsh")
+        || lower.contains("\\dsh\"")
+        || lower.contains("/dsh\"")
+    {
+        return true;
+    }
+
+    // The npm-installed layout: node running a script inside the package.
+    if lower.contains("@deepseek-ai") && lower.contains("dsh") {
+        return true;
+    }
+    // A path that goes through the harness package directory.
+    if lower.contains("deepseek-harness") {
+        return true;
+    }
+
+    false
+}
+
+/// The command line of a process, or `None` when it cannot be read.
+#[cfg(windows)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" \
+                 -ErrorAction SilentlyContinue).CommandLine"
+            ),
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The command line of a process, or `None` when it cannot be read.
+#[cfg(unix)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_command_line(_pid: u32) -> Option<String> {
+    None
 }
 
 /// Whether anything accepts a connection on a loopback port.
@@ -286,28 +428,70 @@ mod tests {
 
         assert!(!is_listening(port), "the port must start free");
         assert!(
-            stop_listener_on(port, std::time::Duration::from_millis(500)).await,
+            matches!(
+                stop_listener_on(port, std::time::Duration::from_millis(500)).await,
+                Ok(true)
+            ),
             "stopping a free port must report success"
         );
     }
 
+    #[test]
+    fn harness_command_lines_are_recognised() {
+        // The safety check that stops the router killing an unrelated process.
+        // Permissive about the path, strict about the shape, because what must
+        // hold is only that the line names a harness rather than some program
+        // that merely bound the right port.
+        for good in [
+            "dsh web",
+            "/usr/local/bin/dsh --profile web",
+            "C:\\Users\\x\\.local\\bin\\dsh.cmd web",
+            "dsh.exe --profile web --port 3081",
+            "node C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js",
+            "/usr/lib/node_modules/@deepseek-ai/dsh/bin.js --profile web",
+            "node /opt/deepseek-harness/lib/bin.js",
+        ] {
+            assert!(
+                looks_like_our_harness(good),
+                "{good:?} should be recognised as a harness"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_command_lines_are_not_recognised() {
+        // The regression this guards: `router stop` killed an unrelated process
+        // that happened to hold the instance's port, and reported success.
+        for bad in [
+            "python -c import socket",
+            "pwsh -NoProfile -Command $l.Start()",
+            "C:\\Windows\\System32\\svchost.exe -k netsvcs",
+            "nginx: worker process",
+            "node server.js",
+            "java -jar app.jar",
+            "postgres -D /var/lib/postgresql/data",
+            "",
+        ] {
+            assert!(
+                !looks_like_our_harness(bad),
+                "{bad:?} must NOT be treated as a harness"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn stopping_a_held_port_actually_frees_it() {
-        // The regression this guards: a stop that reports success while the
-        // listener runs on.
+    async fn a_foreign_listener_is_refused_not_killed() {
+        // The bug, as a test. A child process that is plainly not the harness
+        // binds a port; the function must refuse and leave it alive.
         //
-        // # Why the listener is a separate process
+        // # Why this test is worth its cost
         //
-        // The first version of this test opened the socket in the test process
-        // itself, and `stop_listener_on` — quite correctly — found the test
-        // runner's own PID and killed it. A self-destructing test proves nothing
-        // and takes the suite down with it, so the listener runs in a child that
-        // may safely be terminated.
-        //
-        // The child picks the port and reports it, so the test still never
-        // hardcodes a port.
+        // Killing the wrong process is unrecoverable for the user — they lose
+        // work with no warning and no way to know what happened. A refusal they
+        // can read and act on is strictly better, so the safety property is
+        // asserted rather than assumed.
         #[cfg(windows)]
-        let mut listener = tokio::process::Command::new("pwsh")
+        let mut holder = tokio::process::Command::new("pwsh")
             .args([
                 "-NoProfile",
                 "-Command",
@@ -315,13 +499,13 @@ mod tests {
                  $l.Start();\
                  [Console]::Out.WriteLine($l.LocalEndpoint.Port);\
                  [Console]::Out.Flush();\
-                 Start-Sleep -Seconds 60",
+                 Start-Sleep -Seconds 120",
             ])
             .stdout(Stdio::piped())
             .spawn()
-            .expect("cannot spawn a listener process");
+            .expect("cannot spawn a foreign listener");
         #[cfg(not(windows))]
-        let mut listener = tokio::process::Command::new("python3")
+        let mut holder = tokio::process::Command::new("python3")
             .args([
                 "-c",
                 "import socket,sys,time\n\
@@ -329,43 +513,54 @@ mod tests {
                  s.bind(('127.0.0.1',0))\n\
                  s.listen(1)\n\
                  print(s.getsockname()[1], flush=True)\n\
-                 time.sleep(60)",
+                 time.sleep(120)",
             ])
             .stdout(Stdio::piped())
             .spawn()
-            .expect("cannot spawn a listener process");
+            .expect("cannot spawn a foreign listener");
 
-        // Read the port the child chose.
         let port = {
             use tokio::io::AsyncBufReadExt;
-            let stdout = listener.stdout.take().expect("piped stdout");
+            let stdout = holder.stdout.take().expect("piped stdout");
             let mut lines = tokio::io::BufReader::new(stdout).lines();
             tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line())
                 .await
                 .ok()
                 .and_then(Result::ok)
                 .flatten()
-                .expect("the listener must report the port it bound")
+                .expect("the listener must report its port")
                 .trim()
                 .parse::<u16>()
                 .expect("a port number")
         };
 
+        assert!(is_listening(port), "the foreign listener must be up");
+        let outcome = stop_listener_on(port, std::time::Duration::from_secs(2)).await;
+
+        // Checked *before* the test tears its own listener down, or the
+        // assertion would be about the cleanup rather than about the refusal.
+        let still_alive = holder.try_wait().ok().flatten().is_none();
+        let still_listening = is_listening(port);
+
+        let _ = holder.kill().await;
+        let _ = holder.wait().await;
+
+        match outcome {
+            Err(StopRefusal::NotOurs { pids, .. }) => {
+                assert!(
+                    !pids.is_empty(),
+                    "the refusal must name what holds the port"
+                );
+            }
+            other => panic!("expected a refusal for a foreign listener, got {other:?}"),
+        }
         assert!(
-            is_listening(port),
-            "the listener must be up before we stop it"
+            still_alive,
+            "the foreign process must still be running — refusing means not killing"
         );
-        let result = stop_listener_on(port, std::time::Duration::from_secs(3)).await;
-        let free = !is_listening(port);
-
-        // Clean up whatever survived, so a failure here leaks no process.
-        let _ = listener.kill().await;
-        let _ = listener.wait().await;
-
-        assert!(result, "stopping a listener on port {port} must succeed");
         assert!(
-            free,
-            "the port must actually be free afterwards, not merely reported so"
+            still_listening,
+            "the foreign listener must still hold its port"
         );
     }
 }

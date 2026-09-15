@@ -34,7 +34,10 @@ pub mod supervisor;
 
 pub use multi::{InstanceError, InstanceSpec, MultiConfig, MultiSupervisor};
 pub use process::{is_command_script, kill_tree};
-pub use provisioning::{provision, settings_document, split_model, ProvisionReport};
+pub use provisioning::{
+    is_sharing, provision, set_credential_sharing, settings_document, split_model, ProvisionReport,
+    ShareOutcome,
+};
 pub use readiness::{classify_line, OutputSignal};
 pub use state::{RuntimeFailure, RuntimeState, RuntimeStatus};
 pub use supervisor::{Supervisor, SupervisorConfig};

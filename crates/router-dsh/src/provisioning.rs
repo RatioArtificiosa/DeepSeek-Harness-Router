@@ -91,30 +91,54 @@ pub fn provision(
     // ── .credentials.yaml ────────────────────────────────────────────────
     let credentials_path = state_root.join(".credentials.yaml");
     let mut credentials_created = false;
+    // Whether the host's credentials are *actually* in use, which is not the
+    // same question as whether sharing was requested. Reporting the request
+    // meant this said `true` after a failed link had quietly left a private
+    // empty file behind — the flag appeared to work while the instance had no
+    // credentials at all.
+    let mut credentials_shared = false;
 
     if !credentials_path.exists() {
         if share_credentials {
-            if let Some(host_file) = host_credentials {
-                if host_file.exists() {
+            match host_credentials {
+                Some(host_file) if host_file.exists() => {
                     match link_file(host_file, &credentials_path) {
-                        Ok(()) => credentials_created = true,
+                        Ok(()) => {
+                            credentials_created = true;
+                            credentials_shared = true;
+                        }
                         Err(e) => {
-                            // A link failure must not stop the instance from
-                            // starting; it falls back to a private file and
-                            // says so.
+                            // A failed link must not stop the instance from
+                            // starting, but it must be *reported*. Creating a
+                            // private file keeps the instance usable; claiming
+                            // the credentials are shared would send the user
+                            // looking for a problem somewhere else.
                             tracing::warn!(
                                 error = %e,
+                                host = %host_file.display(),
                                 "could not link shared credentials; creating a private file"
                             );
                             write_empty_credentials(&credentials_path)?;
                             credentials_created = true;
                         }
                     }
-                } else {
+                }
+                Some(host_file) => {
                     tracing::warn!(
                         path = %host_file.display(),
                         "shared credentials requested but the host file does not exist; \
                          creating a private file"
+                    );
+                    write_empty_credentials(&credentials_path)?;
+                    credentials_created = true;
+                }
+                None => {
+                    // Reachable when a caller builds a supervisor without
+                    // deriving the host path. Loud, because the alternative is
+                    // the silent no-op this code used to be.
+                    tracing::warn!(
+                        "shared credentials requested but no host credential path was \
+                         configured; creating a private file"
                     );
                     write_empty_credentials(&credentials_path)?;
                     credentials_created = true;
@@ -124,14 +148,35 @@ pub fn provision(
             write_empty_credentials(&credentials_path)?;
             credentials_created = true;
         }
+    } else if share_credentials {
+        // A file already exists. It is shared only if it is genuinely the host's
+        // — a symlink pointing at it — rather than a private copy from an
+        // earlier run.
+        credentials_shared = points_at(&credentials_path, host_credentials);
     }
 
     Ok(ProvisionReport {
         state_root: state_root.to_path_buf(),
         settings_written,
         credentials_created,
-        credentials_shared: share_credentials,
+        credentials_shared,
     })
+}
+
+/// Whether `link` resolves to the same file as `target`.
+///
+/// Used to answer "are these credentials actually shared?" without trusting
+/// the request that produced them. Falls back to `false` when either path
+/// cannot be read, because the honest answer to an unverifiable question is
+/// "no".
+fn points_at(link: &Path, target: Option<&Path>) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    match (std::fs::canonicalize(link), std::fs::canonicalize(target)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The settings document written for a new instance.
@@ -183,11 +228,12 @@ fn write_empty_credentials(path: &Path) -> Result<()> {
     })
 }
 
-/// Link one file to another, preferring a symlink but falling back to a copy.
+/// Link one file to another with a symlink.
 ///
-/// On Windows a symlink needs either developer mode or elevation, and failing
-/// outright because of that would be a poor experience for a convenience
-/// feature. The copy fallback is documented in the result rather than silent.
+/// On Windows a symlink needs either developer mode or elevation. The caller
+/// handles that failure — it is reported, not swallowed, and the instance falls
+/// back to a private file — because a convenience feature that silently does
+/// nothing is worse than one that visibly declines.
 fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -201,6 +247,112 @@ fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
     {
         let _ = (target, link);
         Err(std::io::Error::other("unsupported platform"))
+    }
+}
+
+/// What changing an instance's sharing actually achieved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareOutcome {
+    /// The instance's file is now a link to the host's credentials.
+    Shared,
+    /// The instance now has its own file, and is not sharing.
+    Private,
+    /// Sharing was requested and could not be done; the instance kept a private
+    /// file. Carries why, so the caller can tell the user.
+    Unavailable(String),
+}
+
+/// Whether an instance currently shares the host's credentials.
+///
+/// Answers by comparing the two files rather than by reading a recorded
+/// intention, so a link that was later broken reads as "not shared".
+#[must_use]
+pub fn is_sharing(state_root: &Path, host_credentials: Option<&Path>) -> bool {
+    points_at(&state_root.join(".credentials.yaml"), host_credentials)
+}
+
+/// Change whether an instance shares the host's credentials.
+///
+/// # Why this is not just a registry flag
+///
+/// The setting is not only recorded in the registry: it decides what
+/// `.credentials.yaml` *is* inside the instance's state root — a link to the
+/// host file, or a standalone one. Flipping the registry and stopping there
+/// would leave the two disagreeing, so an instance marked "shared" would still
+/// hold a private file, or worse, one marked private would still be reading the
+/// host's live credentials.
+///
+/// So the file is reconciled to match. Turning sharing **off** removes the link
+/// and writes a private empty file: the host credentials must stop being
+/// reachable, which is the entire point of the choice.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::IoFailed`] when the state root cannot be written. A
+/// state root that does not exist yet is not an error: the setting is recorded
+/// and `provision` applies it on first start.
+pub fn set_credential_sharing(
+    state_root: &Path,
+    share: bool,
+    host_credentials: Option<&Path>,
+) -> Result<ShareOutcome> {
+    let credentials_path = state_root.join(".credentials.yaml");
+
+    // Nothing provisioned yet, so there is no file to reconcile. The registry
+    // change is the whole change; `provision` will honour it on first start.
+    if !state_root.exists() {
+        return Ok(if share {
+            ShareOutcome::Shared
+        } else {
+            ShareOutcome::Private
+        });
+    }
+
+    if !share {
+        // Stop sharing: the host's credentials must become unreachable.
+        remove_link(&credentials_path)?;
+        write_empty_credentials(&credentials_path)?;
+        return Ok(ShareOutcome::Private);
+    }
+
+    let Some(host) = host_credentials else {
+        return Ok(ShareOutcome::Unavailable(
+            "no host credential path is configured".to_string(),
+        ));
+    };
+    if !host.exists() {
+        return Ok(ShareOutcome::Unavailable(format!(
+            "{} does not exist",
+            host.display()
+        )));
+    }
+    if points_at(&credentials_path, Some(host)) {
+        return Ok(ShareOutcome::Shared); // already done
+    }
+
+    // Replacing a file with a link is not atomic, so the old file goes first.
+    // A failure after this point leaves no file at all, which the next start
+    // repairs by recreating it — better than leaving a stale private file that
+    // looks like sharing but is not.
+    remove_link(&credentials_path)?;
+    match link_file(host, &credentials_path) {
+        Ok(()) => Ok(ShareOutcome::Shared),
+        Err(e) => {
+            write_empty_credentials(&credentials_path)?;
+            Ok(ShareOutcome::Unavailable(e.to_string()))
+        }
+    }
+}
+
+/// Remove a file or link, treating "absent" as already done.
+fn remove_link(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(RouterError::new(
+            ErrorCode::IoFailed,
+            format!("cannot replace {}: {e}", path.display()),
+        )),
     }
 }
 

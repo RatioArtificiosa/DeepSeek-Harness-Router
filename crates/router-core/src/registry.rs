@@ -540,6 +540,16 @@ impl Registry {
         self.instances.get(name)
     }
 
+    /// Look up an instance for modification.
+    ///
+    /// Exposed rather than leaving callers to reach into the `instances` map, so
+    /// that every write goes through a named operation a reviewer can find. The
+    /// registry is saved as a whole document, so the only requirement is that
+    /// mutations happen under [`RegistryLock`].
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Instance> {
+        self.instances.get_mut(name)
+    }
+
     /// Every instance name, in stable order.
     #[must_use]
     pub fn names(&self) -> Vec<&str> {

@@ -31,8 +31,11 @@
 //! one still runs green. A skipped test is honest; a silently-passing fake is
 //! not.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use support::sandbox::{TEST_PORT_BASE, TEST_PORT_SPAN};
 
 /// Locate the harness, or report that this test cannot run here.
 ///
@@ -295,29 +298,33 @@ fn kill_tree(child: &mut std::process::Child) {
 /// presented as "the harness will not start", which reads like a broken build
 /// rather than a busy port.
 ///
-/// So the port is found the same way the router finds one: bind it, and take the
-/// port the OS hands out. The socket is closed before the harness starts, which
-/// leaves a small window, so a lost race surfaces as a clear error message
-/// instead of a silent bad test.
+/// So the port is taken from the test range declared in `support::sandbox`,
+/// which is private to tests and sits far above both the harness default (3080)
+/// and the router's own allocation range (3081+). A test must never start a
+/// harness on a port a person's own instance could already be using.
 ///
-/// The range is kept well clear of 3080 and 3081 — the harness defaults, and
-/// very likely in use by the installation this project must coexist with.
+/// If the chosen port is somehow busy anyway, the next one in the range is
+/// tried, so a stray process from an earlier run cannot fail the suite.
 fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("cannot bind an ephemeral port to find a free one");
-    let port = listener
-        .local_addr()
-        .expect("a bound listener always has an address")
-        .port();
-    // Dropped here so the harness can take the port. The ephemeral range is
-    // large and these are short-lived, so a collision is unlikely — and if one
-    // happens the harness reports `EADDRINUSE` loudly rather than passing.
-    drop(listener);
-    assert!(
-        port > 1024 && port != 3080 && port != 3081,
-        "the OS handed out port {port}, which is not somewhere a test should bind"
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(TEST_PORT_BASE);
+
+    for _ in 0..TEST_PORT_SPAN {
+        let port = NEXT.fetch_add(1, Ordering::Relaxed);
+        if port >= TEST_PORT_BASE + TEST_PORT_SPAN {
+            NEXT.store(TEST_PORT_BASE, Ordering::Relaxed);
+            continue;
+        }
+        // Bound and released: on Windows a just-closed socket can linger, so a
+        // failure here means "try the next one", not "the test is broken".
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!(
+        "no free port in the test range {TEST_PORT_BASE}..{}",
+        TEST_PORT_BASE + TEST_PORT_SPAN
     );
-    port
 }
 
 /// **The acceptance test.**

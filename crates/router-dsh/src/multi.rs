@@ -78,7 +78,42 @@ pub struct MultiConfig {
     /// Extra authorities every instance should accept.
     pub trusted_hosts: Vec<String>,
     /// The host's credential file, used only when an instance shares it.
+    ///
+    /// Left `None` in [`Default`], which means "not configured" — a supervisor
+    /// built without it cannot honour `share_credentials`, and
+    /// [`MultiConfig::with_host_credentials`] is how a caller supplies it.
+    /// Prefer that over setting the field directly, because it also derives the
+    /// path from the environment when the caller does not know it.
     pub host_credentials: Option<PathBuf>,
+}
+
+impl MultiConfig {
+    /// Fill in the host's credential path when the caller did not supply one.
+    ///
+    /// # Why this matters
+    ///
+    /// `host_credentials` defaulted to `None` and nothing ever set it, so
+    /// `--share-credentials` could not work: provisioning saw no host file,
+    /// silently created a private empty one, and still reported success. The
+    /// flag had never done anything.
+    ///
+    /// The path is derived the same way the harness derives its own home — from
+    /// `DSH_HOME` when set, otherwise `~/.dsh` — so pointing at a relocated
+    /// harness still finds its credentials. It is only a *candidate*: whether
+    /// the file exists is decided at provisioning time, and a missing one is
+    /// reported rather than hidden.
+    #[must_use]
+    pub fn with_host_credentials(mut self, os_home: Option<&Path>) -> Self {
+        if self.host_credentials.is_none() {
+            if let Some(dsh_home) = std::env::var_os("DSH_HOME") {
+                let candidate = PathBuf::from(dsh_home).join(".credentials.yaml");
+                self.host_credentials = Some(candidate);
+            } else if let Some(home) = os_home {
+                self.host_credentials = Some(crate::provisioning::host_credentials_path(home));
+            }
+        }
+        self
+    }
 }
 
 impl Default for MultiConfig {

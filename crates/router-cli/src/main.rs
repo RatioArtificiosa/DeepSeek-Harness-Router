@@ -148,6 +148,32 @@ enum Command {
         name: String,
     },
 
+    /// Change an instance's model or credential sharing.
+    ///
+    /// # Why this exists
+    ///
+    /// Without it, `--model` and `--share-credentials` were one-way doors: the
+    /// only way to change either was `router rm` followed by `router add`, and
+    /// `rm` deliberately leaves the state directory on disk. Re-adding the same
+    /// name then reuses that directory, so the "fix" silently carried the old
+    /// settings forward — there was no way to actually undo a choice.
+    Edit {
+        /// Which instance.
+        name: String,
+
+        /// New model. Use `default` to clear the pinned model.
+        #[arg(long, short)]
+        model: Option<String>,
+
+        /// Share the host installation's credentials with this instance.
+        #[arg(long, conflicts_with = "no_share_credentials")]
+        share_credentials: bool,
+
+        /// Stop sharing: give the instance its own credentials file.
+        #[arg(long)]
+        no_share_credentials: bool,
+    },
+
     /// Unregister an instance.
     ///
     /// Its workspace directory is never touched.
@@ -323,6 +349,12 @@ async fn run(cli: Cli, style: &Style) -> Result<ExitCode, Failure> {
             share_credentials,
             no_start,
         } => cmd_add(style, name, workspace, model, share_credentials, no_start).await,
+        Command::Edit {
+            name,
+            model,
+            share_credentials,
+            no_share_credentials,
+        } => cmd_edit(style, &name, model, share_credentials, no_share_credentials).await,
         Command::List { probe } => cmd_list(style, probe),
         Command::Start { name } => cmd_start(style, &name).await,
         Command::Stop { name, all } => cmd_stop(style, name.as_deref(), all).await,
@@ -650,14 +682,16 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
             let instance = registry.get(n).expect("name came from the registry");
             // By port, not by child handle: this process did not start the
             // harness. See `stop_instance`.
-            if stop_instance(instance.port).await {
-                stopped += 1;
-            } else {
-                failures.push(n.to_string());
+            match stop_instance(instance.port).await {
+                Ok(()) => stopped += 1,
+                Err(reason) => failures.push((n.to_string(), reason, instance.port)),
             }
         }
-        for n in &failures {
-            term::err(&style.warn(&format!("{n} is still holding its port")));
+        for (n, reason, port) in &failures {
+            term::err(&style.warn(&format!("{n} was not stopped")));
+            for line in reason.lines(*port) {
+                term::err(&style.dim(&format!("  {line}")));
+            }
         }
         if failures.is_empty() {
             if style.verbosity != Verbosity::Quiet {
@@ -688,14 +722,11 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
     }
     let instance = registry.get(name).expect("checked above");
 
-    if !stop_instance(instance.port).await {
+    if let Err(reason) = stop_instance(instance.port).await {
         // Reporting success here would be the worst outcome: the user stops
         // looking while the harness keeps the port, and the next start fails
         // for a reason nothing on screen explains.
-        return Err(Failure::runtime(
-            format!("{name} is still listening on port {}", instance.port),
-            "The process could not be stopped. Run `router doctor` to see it.",
-        ));
+        return Err(stop_failure(name, &reason, instance.port));
     }
 
     if style.verbosity != Verbosity::Quiet {
@@ -718,10 +749,108 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
 /// report success. The harness's port is the one fact both processes agree on,
 /// and holding it is the whole reason the harness is running.
 ///
-/// Returns `true` when nothing is listening afterwards, which includes the
+/// Stop whatever holds an instance's port, if it is the harness we started.
+///
+/// # Why the port, and not a child handle
+///
+/// `stop` runs in a different process from `start`. The supervisor that spawned
+/// the harness is in the other one, so this process has no child to signal — and
+/// a supervisor asked to stop an instance it never started would do nothing and
+/// report success. The harness's port is the one fact both processes agree on.
+///
+/// # Why the listener is identified first
+///
+/// Agreement on a port is not identity. An earlier revision killed whatever held
+/// the port, and was confirmed to kill an unrelated process that happened to
+/// bind it — while reporting success. The listener is now checked against the
+/// harness invocation before anything is signalled.
+///
+/// Returns `Ok(())` when nothing is listening afterwards, which includes the
 /// already-stopped case: "make it not run" is satisfied either way.
-async fn stop_instance(port: u16) -> bool {
-    router_dsh::process::stop_listener_on(port, std::time::Duration::from_secs(5)).await
+async fn stop_instance(port: u16) -> Result<(), StopFailure> {
+    match router_dsh::process::stop_listener_on(port, std::time::Duration::from_secs(5)).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StopFailure::StillListening { port }),
+        Err(router_dsh::process::StopRefusal::NotOurs { pids, commands }) => {
+            Err(StopFailure::Foreign { pids, commands })
+        }
+        Err(router_dsh::process::StopRefusal::Unknown) => Err(StopFailure::Unidentified),
+    }
+}
+
+/// Why an instance could not be stopped.
+///
+/// A typed reason rather than a string, because callers must distinguish "our
+/// harness would not die" from "something that is not ours holds the port". The
+/// first must block a removal — it would orphan a running agent. The second must
+/// not: nothing of ours is running, the registry entry is ours to delete, and
+/// the foreign process is not ours to kill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopFailure {
+    /// The port is held by a process that is not our harness.
+    Foreign {
+        /// The offending process ids.
+        pids: Vec<u32>,
+        /// Their command lines, for display.
+        commands: Vec<String>,
+    },
+    /// Something is still listening after an attempt to stop it.
+    StillListening {
+        /// The port that did not free.
+        port: u16,
+    },
+    /// The owner of the port could not be determined.
+    Unidentified,
+}
+
+impl StopFailure {
+    /// Whether this is a foreign process rather than a stubborn harness.
+    ///
+    /// Decided by variant, not by matching on message text: a reworded message
+    /// must not silently change when an instance can be removed.
+    const fn is_foreign(&self) -> bool {
+        matches!(self, Self::Foreign { .. })
+    }
+
+    /// A multi-line explanation for the user, referencing the port that failed.
+    fn describe(&self, port: u16) -> String {
+        match self {
+            Self::Foreign { pids, commands } => {
+                let who = commands
+                    .iter()
+                    .zip(pids.iter())
+                    .map(|(c, p)| format!("pid {p}: {c}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "port {port} is held by something that is not this router's harness:\n{who}"
+                )
+            }
+            Self::StillListening { port } => {
+                format!("something is still listening on port {port}")
+            }
+            Self::Unidentified => format!("cannot determine which process holds port {port}"),
+        }
+    }
+
+    /// Every line of the explanation, for indented display.
+    fn lines(&self, port: u16) -> Vec<String> {
+        self.describe(port)
+            .lines()
+            .map(ToString::to_string)
+            .collect()
+    }
+}
+
+/// Turn a stop refusal into a failure the user can act on.
+fn stop_failure(name: &str, reason: &StopFailure, port: u16) -> Failure {
+    Failure::runtime(
+        format!("{name} was not stopped"),
+        format!(
+            "{}\n  Nothing was killed. Find the owner with `router doctor`.",
+            reason.describe(port)
+        ),
+    )
 }
 
 async fn cmd_restart(style: &Style, name: &str) -> Result<ExitCode, Failure> {
@@ -982,21 +1111,37 @@ async fn cmd_rm(style: &Style, name: &str, yes: bool) -> Result<ExitCode, Failur
         ));
     }
 
-    // Stop it first, and refuse to proceed if it will not stop. Forgetting a
-    // running instance is worse than failing: the process outlives the record
-    // of it.
+    // Stop it first, and refuse to proceed if one of *our* harnesses will not
+    // stop. Forgetting a running instance is worse than failing: the process
+    // outlives the record of it.
+    //
+    // A port held by something that is **not** our harness is a different case,
+    // and deliberately does not block the removal. Nothing of ours is running,
+    // so there is no orphan to create; the registry entry is ours to delete; and
+    // the foreign process is not ours to kill. Blocking here would trap the user
+    // with an instance they cannot remove because an unrelated program happens
+    // to hold its port. The collision is reported, because it explains why the
+    // port may be unusable later.
     if serving {
-        if !stop_instance(instance.port).await {
-            return Err(Failure::runtime(
-                format!(
-                    "{name} is still serving on port {} and was not removed",
+        match stop_instance(instance.port).await {
+            Ok(()) => {
+                if style.verbosity != Verbosity::Quiet {
+                    term::out(&style.dim(&format!("  Stopped {name} on port {}.", instance.port)));
+                }
+            }
+            Err(ref reason) if reason.is_foreign() => {
+                term::err(&style.warn(&format!(
+                    "  port {} is not held by this router",
                     instance.port
-                ),
-                "Stop it first with `router stop`, or find it with `router doctor`.",
-            ));
-        }
-        if style.verbosity != Verbosity::Quiet {
-            term::out(&style.dim(&format!("  Stopped {name} on port {}.", instance.port)));
+                )));
+                for line in reason.lines(instance.port) {
+                    term::err(&style.dim(&format!("    {line}")));
+                }
+                term::err(
+                    &style.dim("    Removing the instance anyway: nothing of ours is running."),
+                );
+            }
+            Err(ref reason) => return Err(stop_failure(name, reason, instance.port)),
         }
     }
 
@@ -1160,10 +1305,168 @@ fn resolve_harness() -> Result<PathBuf, Failure> {
 }
 
 fn build_supervisor() -> Result<MultiSupervisor, Failure> {
-    Ok(MultiSupervisor::new(MultiConfig {
-        binary: resolve_harness()?,
-        ..MultiConfig::default()
-    }))
+    // The host credential path must be derived here, or `--share-credentials`
+    // silently does nothing: provisioning simply sees no host file and writes a
+    // private empty one. The OS home comes from the same environment the harness
+    // uses, so a relocated harness still resolves correctly.
+    let os_home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+
+    Ok(MultiSupervisor::new(
+        MultiConfig {
+            binary: resolve_harness()?,
+            ..MultiConfig::default()
+        }
+        .with_host_credentials(os_home.as_deref()),
+    ))
+}
+
+async fn cmd_edit(
+    style: &Style,
+    name: &str,
+    model: Option<String>,
+    share_credentials: bool,
+    no_share_credentials: bool,
+) -> Result<ExitCode, Failure> {
+    let (home, registry) = load(None)?;
+    let instance = registry
+        .get(name)
+        .cloned()
+        .ok_or_else(|| unknown_instance(name, &registry))?;
+
+    if model.is_none() && !share_credentials && !no_share_credentials {
+        return Err(Failure::usage(
+            "nothing to change".to_string(),
+            format!(
+                "Give at least one of: --model <MODEL>, --share-credentials, \
+                 --no-share-credentials. Or see `router edit {name} --help`."
+            ),
+        ));
+    }
+
+    // A running instance holds its settings in memory: the harness reads
+    // `settings.yaml` at boot and the model default is process-wide, so editing
+    // the files underneath it would change nothing until it restarts — while
+    // the registry claimed the new value immediately. Refusing is clearer than
+    // recording a change that has not taken effect.
+    if probe_port(instance.port) {
+        return Err(Failure::runtime(
+            format!("{name} is serving on port {}", instance.port),
+            format!("Stop it first: router stop {name}"),
+        ));
+    }
+
+    // `default` is how a user clears a pinned model. Clearing has to be
+    // spellable, or the original choice remains a one-way door.
+    let clear_model = model
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("default"));
+    if let Some(m) = &model {
+        if m.is_empty() {
+            return Err(Failure::usage(
+                "the model name is empty".to_string(),
+                format!("Use `router edit {name} --model default` to clear it."),
+            ));
+        }
+    }
+
+    let state_root = Registry::state_root(home.root(), name);
+    let os_home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    let host_credentials = host_credential_path(os_home.as_deref());
+
+    // Credentials are reconciled on disk *before* the registry is written.
+    // If the file cannot be changed, the registry must not claim it was.
+    let mut share_outcome = None;
+    if share_credentials || no_share_credentials {
+        let outcome = router_dsh::set_credential_sharing(
+            &state_root,
+            share_credentials,
+            host_credentials.as_deref(),
+        )
+        .map_err(|e| {
+            Failure::runtime(e.detail.clone(), "Check that the state root is writable.")
+        })?;
+        share_outcome = Some(outcome);
+    }
+
+    let new_model = if clear_model {
+        None
+    } else if let Some(m) = &model {
+        Some(m.clone())
+    } else {
+        instance.model.clone()
+    };
+    let new_share = if share_credentials {
+        true
+    } else if no_share_credentials {
+        false
+    } else {
+        instance.share_credentials
+    };
+
+    update_registry(&home, |registry| {
+        // Checked before taking the mutable borrow: `unknown_instance` reads the
+        // whole registry to list the names it knows, which cannot happen while
+        // an entry is mutably borrowed.
+        if !registry.contains(name) {
+            return Err(unknown_instance(name, registry));
+        }
+        let entry = registry.get_mut(name).expect("checked immediately above");
+        entry.model = new_model.clone();
+        entry.share_credentials = new_share;
+        Ok(())
+    })?;
+
+    if style.verbosity != Verbosity::Quiet {
+        term::out(&style.ok(&format!("Updated {}", style.strong(name))));
+        match (&model, clear_model) {
+            (Some(_), true) => term::out(&style.field("model", "cleared (harness default)")),
+            (Some(m), false) => term::out(&style.field("model", m)),
+            (None, _) => term::out(&style.field("model", "unchanged")),
+        }
+
+        match &share_outcome {
+            Some(router_dsh::ShareOutcome::Shared) => {
+                term::out(&style.field("credentials", "shared with the host installation"));
+            }
+            Some(router_dsh::ShareOutcome::Private) => {
+                term::out(&style.field("credentials", "private to this instance"));
+            }
+            Some(router_dsh::ShareOutcome::Unavailable(why)) => {
+                // The registry still records the request, but the user must know
+                // the instance is not actually sharing — otherwise the next
+                // thing they see is a harness that cannot authenticate, with
+                // nothing pointing at why.
+                term::err(&style.warn(&format!("  credentials were NOT shared: {why}")));
+                term::err(&style.dim(
+                    "    The instance will use its own file. On Windows a symlink \
+                     needs Developer Mode or an elevated shell.",
+                ));
+            }
+            None => {}
+        }
+
+        term::out("");
+        term::out(&style.dim(&format!(
+            "  Changes apply when it next starts:  router start {name}"
+        )));
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Where the host installation keeps its credentials.
+///
+/// `DSH_HOME` wins when set, so a relocated harness is still found; otherwise
+/// the harness default under the OS home.
+fn host_credential_path(os_home: Option<&std::path::Path>) -> Option<PathBuf> {
+    if let Some(dsh_home) = std::env::var_os("DSH_HOME") {
+        return Some(PathBuf::from(dsh_home).join(".credentials.yaml"));
+    }
+    os_home.map(|h| h.join(".dsh").join(".credentials.yaml"))
 }
 
 fn unknown_instance(name: &str, registry: &Registry) -> Failure {

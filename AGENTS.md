@@ -76,6 +76,31 @@ machine running the lab may be running unrelated containers.
 - **Never** stop, remove, or restart a container this project did not create.
 - **Never** delete or rename a volume this project does not own.
 
+### 6. Test harnesses use a dedicated port range, and are always stopped
+
+**Automated or exploratory testing must never start a harness on a port a person
+might be using.** The default instance ports (`3081+`) are exactly where a real
+user's second instance would be, so a test that allocates there can collide with
+live work — and, before the identity check was added, could have killed it.
+
+- Test instances allocate from **3400x–3499x only**. Never 3080, 3081, or the
+  low `30xx` range.
+- **Every start is paired with a stop in the same run.** Use a `try`/`finally`,
+  so a failing assertion still stops the harness. A test that leaks a harness
+  leaves a process the user can see on their machine but did not create.
+- **Before finishing any session that started instances, check for leftovers:**
+  list every `node` process whose command line contains `--profile web` (or
+  `dsh` and `web`), and verify each is one you meant to leave running. Report
+  and stop anything you left behind.
+- **Stop by PID after confirming identity**, never by port. Killing by port is
+  what the `stop`/`rm` identity check exists to prevent.
+
+This rule exists because it was broken: a session of CLI testing left four
+harnesses running on ports 3082–3085, visible to the user as unexplained
+services. The failure was not the tool's — it was a person killing the
+supervising process and assuming the harness went with it.
+
+
 ---
 
 ## The privacy rule
