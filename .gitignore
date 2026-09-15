@@ -28,7 +28,8 @@ logs/
 # Rust
 target/
 **/target/
-Cargo.lock.bak
+# Cargo.lock IS committed: this workspace produces a binary, so the lockfile
+# is the reproducibility contract (PROPOSAL.md 43.4, 15.2).
 
 # Node (build tooling only; the runtime never needs it on the host)
 node_modules/

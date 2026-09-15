@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/router-core",
+    "crates/router-relay",
+    "crates/router-dsh",
+    "crates/router-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/RatioArtificiosa/DeepSeek-Harness-Router"
+authors = ["DeepSeek Harness Router contributors"]
+
+[workspace.dependencies]
+# Internal crates
+router-core = { path = "crates/router-core" }
+router-relay = { path = "crates/router-relay" }
+router-dsh = { path = "crates/router-dsh" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP / WebSocket
+axum = { version = "0.8", features = ["ws"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http = "1"
+http-body-util = "0.1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Errors & logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

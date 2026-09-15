@@ -1,0 +1,24 @@
+[package]
+name = "router-cli"
+description = "The DeepSeek Harness Router binary: serve, entrypoint, and doctor subcommands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "router"
+path = "src/main.rs"
+
+[dependencies]
+router-core.workspace = true
+router-relay.workspace = true
+router-dsh.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true

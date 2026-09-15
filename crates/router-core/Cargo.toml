@@ -1,0 +1,19 @@
+[package]
+name = "router-core"
+description = "Core types, configuration, health model, and workspace validation for DeepSeek Harness Router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
