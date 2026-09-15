@@ -1890,7 +1890,7 @@ fn unknown_instance(name: &str, registry: &Registry) -> Failure {
 /// checked against the process actually holding the port. That gives three states
 /// that need different words, so this returns them rather than a bool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Serving {
+pub enum Serving {
     /// The harness this router started is answering on the port.
     Ours,
     /// Something is answering, but it is not the instance we started. Usually a
@@ -1901,7 +1901,7 @@ enum Serving {
 }
 
 /// Classify an instance's port, including who holds it.
-fn serving_state(instance_dir: &std::path::Path, port: u16) -> Serving {
+pub fn serving_state(instance_dir: &std::path::Path, port: u16) -> Serving {
     if !probe_port(port) {
         return Serving::Down;
     }

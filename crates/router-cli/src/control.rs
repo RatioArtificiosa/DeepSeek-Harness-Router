@@ -30,7 +30,7 @@ use router_core::term::{self, Style};
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use crate::Failure;
+use crate::{Failure, Serving};
 
 /// Build the relay routes for every registered instance.
 ///
@@ -424,14 +424,29 @@ pub fn render(home: &RouterHome, registry: &Registry) -> String {
     // Probing is the expensive part — a socket connect per instance — so it is
     // done once here and the answer is passed down, rather than each row asking
     // again. Two inconsistent answers on one page would be worse than slow.
-    let live: Vec<(&String, &Instance, bool)> = instances
+    //
+    // The state is ownership-aware, the same classification `router status` and
+    // `router list --probe` use. Asking only whether the port answers made this
+    // page report a foreign harness as a healthy instance — a green "SERVING"
+    // badge on an instance the router never started and cannot stop.
+    let live: Vec<(&String, &Instance, Serving)> = instances
         .iter()
-        .map(|(name, instance)| (*name, *instance, crate::probe_port(instance.port)))
+        .map(|(name, instance)| {
+            (
+                *name,
+                *instance,
+                crate::serving_state(&home.instance_dir(name), instance.port),
+            )
+        })
         .collect();
 
     let total = live.len();
-    let running = live.iter().filter(|(_, _, up)| *up).count();
-    let stopped = total.saturating_sub(running);
+    let running = live.iter().filter(|(_, _, s)| *s == Serving::Ours).count();
+    let foreign = live
+        .iter()
+        .filter(|(_, _, s)| *s == Serving::Foreign)
+        .count();
+    let stopped = total.saturating_sub(running).saturating_sub(foreign);
     let missing: Vec<&str> = live
         .iter()
         .filter(|(_, instance, _)| !instance.workspace.is_dir())
@@ -443,8 +458,8 @@ pub fn render(home: &RouterHome, registry: &Registry) -> String {
         .collect();
 
     let mut rows = String::new();
-    for (name, instance, up) in &live {
-        rows.push_str(&render_row(name, instance, *up, home));
+    for (name, instance, state) in &live {
+        rows.push_str(&render_row(name, instance, *state, home));
     }
 
     if instances.is_empty() {
@@ -463,6 +478,10 @@ pub fn render(home: &RouterHome, registry: &Registry) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DeepSeek Harness Router</title>
+<!-- Inlined rather than served from a file: a data URI is one less request, and
+     without any icon the browser asks for /favicon.ico on every load and logs a
+     404 — noise in the console of a page that is otherwise clean. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Cpath d='M20 6 L32 13 L32 27 L20 34 L8 27 L8 13 Z' fill='none' stroke='%234f8cff' stroke-width='2.4' stroke-linejoin='round'/%3E%3Ccircle cx='20' cy='20' r='4' fill='%2337e0c8'/%3E%3C/svg%3E">
 <style>{css}</style>
 </head>
 <body>
@@ -501,6 +520,7 @@ pub fn render(home: &RouterHome, registry: &Registry) -> String {
       <span class="k">Stopped</span>
       <span class="v {down_class}">{stopped}</span>
     </div>
+    {held_stat}
     <div class="stat">
       <span class="k">Models in use</span>
       <span class="v">{model_count}</span>
@@ -532,6 +552,15 @@ pub fn render(home: &RouterHome, registry: &Registry) -> String {
         stopped = stopped,
         up_class = if running > 0 { "up" } else { "idle" },
         down_class = if stopped > 0 { "down" } else { "idle" },
+        // Only shown when non-zero: a permanently visible zero invites the reader
+        // to wonder what it means when the answer is "never anything".
+        held_stat = if foreign > 0 {
+            format!(
+                r#"<div class="stat"><span class="k">Held by another process</span><span class="v down">{foreign}</span></div>"#
+            )
+        } else {
+            String::new()
+        },
         model_count = models.len(),
         warning = render_warning(&missing),
         rows = rows,
@@ -567,23 +596,25 @@ fn render_warning(missing: &[&str]) -> String {
 }
 
 /// One instance row.
-fn render_row(name: &str, instance: &Instance, serving: bool, home: &RouterHome) -> String {
+fn render_row(name: &str, instance: &Instance, state: Serving, home: &RouterHome) -> String {
     let workspace_ok = instance.workspace.is_dir();
-    // The link is root-relative and goes through this page's own origin, not
-    // the instance's bare port. A direct `127.0.0.1:<port>` link looks like it
-    // should work and does not: the harness names its auth cookie after the
-    // request authority, so a page reached that way cannot talk to a gateway
-    // that mints the cookie for a different one. The user-visible result was
-    // "failed to fetch gateway" — which is why `/i/<name>` exists, and why the
-    // link has to use it. Being relative, it also cannot hard-code a host.
+
+    // The link goes through this page's own origin, which is the URL that works
+    // in a browser: the harness names its auth cookie after the request
+    // authority, so the page and the instance must share one. Being
+    // root-relative, it also cannot hard-code a host.
     let url = format!("/i/{name}");
 
     // State is carried by a word and a shape, not by colour alone — a
     // colour-blind reader must get the same information.
-    let (state_class, state_word) = if serving {
-        ("up", "serving")
-    } else {
-        ("down", "stopped")
+    //
+    // Three states, and the third needs its own words. "Stopped" for a port held
+    // by a foreign process would suggest that starting it is the fix, when the
+    // router will deliberately refuse to start it.
+    let (state_class, state_word) = match state {
+        Serving::Ours => ("up", "serving"),
+        Serving::Foreign => ("held", "port taken"),
+        Serving::Down => ("down", "stopped"),
     };
 
     let workspace_note = if workspace_ok {
@@ -597,12 +628,13 @@ fn render_row(name: &str, instance: &Instance, serving: bool, home: &RouterHome)
         None => r#"<span class="muted">default</span>"#.to_string(),
     };
 
-    // A serving instance links; a stopped one does not, because a link that
-    // leads nowhere is worse than no link.
+    // Only an instance this router is actually serving links; the other two do
+    // not, because a link that leads nowhere — or, worse, to somebody else's
+    // harness — is worse than no link.
     //
     // The tooltip still names the port, because that is what a user needs when
     // they go looking for the process — but it is deliberately not the link.
-    let port_cell = if serving {
+    let port_cell = if state == Serving::Ours {
         format!(
             r#"<a class="port" href="{url}" title="Open {name} (its own port is {port})">{port}</a>"#,
             url = html_escape(&url),
@@ -611,6 +643,20 @@ fn render_row(name: &str, instance: &Instance, serving: bool, home: &RouterHome)
         )
     } else {
         format!(r#"<span class="port dead">{}</span>"#, instance.port)
+    };
+
+    // What is holding the port, when something else is. Naming it is the whole
+    // value of the state: "port taken" alone sends the reader to `netstat`.
+    let held_note = if state == Serving::Foreign {
+        let who = router_dsh::process::describe_listener(instance.port)
+            .unwrap_or_else(|| "another process".to_string());
+        format!(
+            r#"<span class="flag held" title="{}">held by {}</span>"#,
+            html_escape(&who),
+            html_escape(&who)
+        )
+    } else {
+        String::new()
     };
 
     // The state root is the instance's own DSH_HOME. Showing it is not
@@ -626,6 +672,7 @@ fn render_row(name: &str, instance: &Instance, serving: bool, home: &RouterHome)
         <span class="dot {state_class}" aria-hidden="true"></span>
         <span class="label">{name}</span>
         <span class="state">{state_word}</span>
+        {held_note}
       </td>
       <td>{port_cell}</td>
       <td class="ws" title="{ws_full}">{ws}{flag}</td>
@@ -640,6 +687,7 @@ fn render_row(name: &str, instance: &Instance, serving: bool, home: &RouterHome)
         state_class = state_class,
         name = html_escape(name),
         state_word = state_word,
+        held_note = held_note,
         port_cell = port_cell,
         ws_full = html_escape(&instance.workspace.display().to_string()),
         ws = html_escape(&short_path(&instance.workspace.display().to_string())),
@@ -720,6 +768,9 @@ const CSS: &str = r#"
   --bg: #0a0e1a; --panel: #0d1628; --line: #1e2a44;
   --ink: #e8eef9; --dim: #8296b5; --faint: #55668a;
   --up: #37e0c8; --down: #f0a341; --accent: #4f8cff;
+  /* A port held by a process we did not start. Its own colour because it is
+     neither healthy nor stopped, and borrowing either one misleads. */
+  --held: #e0625f;
   color-scheme: dark light;
 }
 @media (prefers-color-scheme: light) {
@@ -727,6 +778,7 @@ const CSS: &str = r#"
     --bg: #f6f8fc; --panel: #ffffff; --line: #dde4f0;
     --ink: #101a2e; --dim: #5a6b87; --faint: #8b9ab4;
     --up: #0d9488; --down: #b45309; --accent: #2563eb;
+    --held: #c2410c;
   }
 }
 * { box-sizing: border-box; }
@@ -801,6 +853,9 @@ tr.detail code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, m
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .dot.up { background: var(--up); box-shadow: 0 0 0 3px color-mix(in srgb, var(--up) 22%, transparent); }
 .dot.down { background: transparent; border: 1.5px solid var(--faint); }
+/* A port held by something we did not start. Distinct from both: filled like a
+   live dot, because something IS running, but amber, because it is not ours. */
+.dot.held { background: var(--held); box-shadow: 0 0 0 3px color-mix(in srgb, var(--held) 22%, transparent); }
 .label { font-weight: 600; }
 .state { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.06em; }
 .port {
@@ -811,6 +866,9 @@ tr.detail code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, m
 .port.dead { color: var(--faint); font-weight: 500; }
 .ws { font: 12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--dim); word-break: break-all; }
 .flag { margin-left: 8px; font-size: 11px; color: var(--down); border: 1px solid var(--down); border-radius: 5px; padding: 1px 6px; }
+/* Same shape as the missing-workspace flag, different ink: both are conditions
+   the user has to act on, and neither is a display detail. */
+.flag.held { color: var(--held); border-color: var(--held); }
 .model { font-size: 13px; }
 .muted { color: var(--faint); }
 .empty { text-align: center; padding: 56px 20px; color: var(--dim); }
@@ -1003,6 +1061,10 @@ mod tests {
     /// The page decides "serving" by probing for an HTTP status line, so a bare
     /// listening socket reads as stopped. A test that wants a serving row has to
     /// answer like a server, not merely accept a connection.
+    ///
+    /// Ownership is also checked now, so a caller that wants a *serving* row must
+    /// additionally record a PID that holds the port — see
+    /// [`spawn_owned_instance`].
     fn spawn_http_responder() -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read as _, Write as _};
 
@@ -1022,19 +1084,36 @@ mod tests {
         (port, handle)
     }
 
+    /// An instance the page will render as fully serving.
+    ///
+    /// The responder runs as a thread of *this* process, so recording this
+    /// process's PID is an honest claim: the PID it names really does hold the
+    /// port, which is exactly what the ownership check verifies.
+    fn spawn_owned_instance(
+        name: &str,
+        home: &RouterHome,
+        workspace: PathBuf,
+    ) -> (Registry, std::thread::JoinHandle<()>) {
+        let (port, server) = spawn_http_responder();
+        router_dsh::browser::write_pid(&home.instance_dir(name), std::process::id()).unwrap();
+
+        let mut registry = Registry::default();
+        registry
+            .insert(name, Instance::new(workspace, port))
+            .unwrap();
+        (registry, server)
+    }
+
     #[test]
     fn a_serving_instance_links_through_the_gateway_prefix() {
         // The link must not point at the instance's bare port. Reaching a
         // gateway from a page served on another authority is what produced
         // "failed to fetch gateway", and the port link recreates exactly that
         // situation — it looks correct and cannot work.
+        let home = home();
         let name = "linked-instance";
-        let (port, server) = spawn_http_responder();
-        let mut registry = Registry::default();
-        registry
-            .insert(name, Instance::new(PathBuf::from("/tmp/linked"), port))
-            .unwrap();
-        let page = render(&home(), &registry);
+        let (registry, server) = spawn_owned_instance(name, &home, PathBuf::from("/tmp/linked"));
+        let page = render(&home, &registry);
         drop(server);
 
         assert!(
@@ -1042,8 +1121,37 @@ mod tests {
             "a serving instance must link through the gateway prefix:\n{page}"
         );
         assert!(
-            !page.contains(&format!(r#"href="http://127.0.0.1:{port}""#)),
+            !page.contains(r#"href="http://127.0.0.1:"#),
             "the bare-port link is the bug this replaced:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_port_held_by_something_we_did_not_start_is_not_serving() {
+        // The regression this guards, found by loading the page in a real
+        // browser: it reported a foreign harness as a healthy instance, with a
+        // green SERVING badge and a link into somebody else's UI.
+        let home = home();
+        let (port, server) = spawn_http_responder();
+        let mut registry = Registry::default();
+        registry
+            .insert("taken", Instance::new(PathBuf::from("/tmp/taken"), port))
+            .unwrap();
+        // No PID recorded, so ownership cannot be proved.
+        let page = render(&home, &registry);
+        drop(server);
+
+        assert!(
+            page.contains("port taken"),
+            "a foreign holder must not read as serving:\n{page}"
+        );
+        assert!(
+            !page.contains(r#"href="/i/taken""#),
+            "we must not link into a harness we do not manage:\n{page}"
+        );
+        assert!(
+            page.contains("Held by another process"),
+            "the summary must account for the third state:\n{page}"
         );
     }
 
