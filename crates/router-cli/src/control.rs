@@ -107,23 +107,6 @@ pub fn clear_gateway_port(home: &RouterHome) {
 ///
 /// # Why a cookie, and why it is the only workable basis
 ///
-/// The harness builds some of its own URLs from the origin rather than the
-/// current path — the live gateway socket at `/api/remote.mux` above all. Those
-/// requests arrive at the gateway naming no instance, and no response rewriting
-/// can help, because the URL is assembled in JavaScript at runtime.
-///
-/// The gateway must therefore infer the instance. A cookie is the honest way to
-/// do it: it is per-browser, so two tabs on two instances do not fight, and it is
-/// set at the one moment the user's intent is unambiguous — when they open
-/// `/i/<name>/`.
-///
-/// It is deliberately *not* `HttpOnly`-only with a secret: it carries no
-/// authority of its own, only a routing hint. The harness still authenticates
-/// every request with its own cookie, so a forged value can at most point a
-/// browser at an instance it could not otherwise reach — and the harness refuses
-/// that request anyway.
-const AFFINITY_COOKIE: &str = "dsr-instance";
-
 /// The instance named in an `/i/<name>...` path, if there is one.
 fn instance_from_path(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/i/")?;
@@ -159,39 +142,59 @@ fn prefix_request(req: axum::extract::Request, name: &str) -> axum::extract::Req
     axum::extract::Request::from_parts(parts, body)
 }
 
-/// The instance this browser is currently using, from its cookie.
+/// The instance a root-rooted request belongs to.
+///
+/// # Why the `Referer` and not a cookie
+///
+/// The gateway has to decide which instance an origin-rooted request is for —
+/// `/api/remote.mux` names none. The first attempt used a cookie recording the
+/// "current instance", which broke the moment two tabs were open: the second tab
+/// overwrote it and the first tab's requests went to the wrong harness. A marker
+/// per instance was better but still could not choose *between* them, so with two
+/// tabs open the app lost those calls entirely.
+///
+/// The browser already answers this exactly, per request: a fetch from
+/// `/i/notes/` carries `Referer: …/i/notes/`, and one from `/i/probe/` carries
+/// `/i/probe/`. That is the instance the request genuinely came from, stated by
+/// the browser for each request rather than inferred across them, so two tabs
+/// never contend.
+///
+/// It is a routing hint, not a security boundary: a client can send any
+/// `Referer` it likes. That is acceptable because the harness authenticates every
+/// request with its own cookie and trust fence — a forged value can only aim a
+/// request at an instance that will then refuse it.
 fn current_instance(req: &axum::extract::Request) -> Option<String> {
-    let cookies = req
+    let referer = req
         .headers()
-        .get(axum::http::header::COOKIE)?
+        .get(axum::http::header::REFERER)?
         .to_str()
         .ok()?;
-    cookies.split(';').find_map(|part| {
-        let (key, value) = part.trim().split_once('=')?;
-        (key == AFFINITY_COOKIE && !value.is_empty()).then(|| value.to_string())
-    })
+
+    // Only the path matters; the authority is the gateway either way.
+    let path = referer
+        .split_once("://")
+        .map_or(referer, |(_, rest)| rest)
+        .split_once('/')
+        .map_or("", |(_, path)| path);
+
+    let name = instance_from_path(&format!("/{path}"))?;
+
+    // A page for an instance the gateway is not serving routes nowhere, so
+    // decline rather than forwarding to a prefix no route matches.
+    req.extensions()
+        .get::<KnownInstances>()
+        .is_some_and(|known| known.0.iter().any(|n| n == &name))
+        .then_some(name)
 }
 
-/// Attach the affinity cookie to a response when the path names an instance.
-fn with_affinity_cookie(
-    mut response: axum::response::Response,
-    path: &str,
-) -> axum::response::Response {
-    let Some(name) = instance_from_path(path) else {
-        return response;
-    };
-    // Only the instance's own document sets affinity. Setting it on every asset
-    // request would be noise, and setting it on an API call would make a stray
-    // background request silently re-point the browser.
-    if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
-        "{AFFINITY_COOKIE}={name}; Path=/; SameSite=Lax"
-    )) {
-        response
-            .headers_mut()
-            .append(axum::http::header::SET_COOKIE, value);
-    }
-    response
-}
+/// The instance names the gateway currently serves, attached to each request.
+///
+/// Passed through request extensions rather than read from the registry per
+/// request: the registry is a file, and re-reading it on every origin-rooted call
+/// would put disk I/O on the hot path for a list that changes only when an
+/// instance is added or removed.
+#[derive(Debug, Clone)]
+pub struct KnownInstances(pub Vec<String>);
 
 /// Serve the control page and the instance gateway until interrupted.
 ///
@@ -264,6 +267,7 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
     // worse than no control page.
     let home_for_page = home.clone();
     let fallback = registry.clone();
+    let known_names: Vec<String> = registry.instances.keys().cloned().collect();
 
     // The relay, if there is anything to relay.
     //
@@ -307,23 +311,26 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
             let home = home_for_page.clone();
             let fallback = fallback.clone();
             let relay = relay.clone();
+            let known_names = known_names.clone();
             async move {
                 let path = req.uri().path().to_string();
+
+                // Which instances exist, for `current_instance` to check against.
+                // Attached here rather than read from the registry per request.
+                let (mut parts, body) = req.into_parts();
+                parts.extensions.insert(KnownInstances(known_names.clone()));
+                let req = axum::extract::Request::from_parts(parts, body);
 
                 // An instance path goes to the relay.
                 if let Some(relay) = relay {
                     if path.starts_with("/i/") {
                         use tower::ServiceExt as _;
-                        let response = relay.clone().oneshot(req).await.unwrap_or_else(|e| {
+                        return relay.clone().oneshot(req).await.unwrap_or_else(|e| {
                             axum::response::Response::builder()
                                 .status(axum::http::StatusCode::BAD_GATEWAY)
                                 .body(axum::body::Body::from(format!("relay failed: {e}")))
                                 .expect("a fixed response always builds")
                         });
-                        // Opening an instance marks this browser as using it, so
-                        // the app's origin-rooted requests can be routed back
-                        // here — see `AFFINITY_COOKIE`.
-                        return with_affinity_cookie(response, &path);
                     }
 
                     // A root-absolute harness path, sent by an app that is
@@ -342,8 +349,8 @@ pub async fn serve(style: &Style, port: u16, no_open: bool) -> Result<ExitCode, 
                     // No amount of response rewriting fixes it: the URL is
                     // constructed in JavaScript at runtime, not present in any
                     // document the relay can edit. The gateway therefore has to
-                    // decide, and the only honest basis is *which instance this
-                    // browser is currently using* — recorded when it opened one.
+                    // decide, and `current_instance` explains how it does so
+                    // correctly per request rather than per browser.
                     if is_harness_root_path(&path) {
                         if let Some(name) = current_instance(&req) {
                             use tower::ServiceExt as _;
@@ -1108,52 +1115,68 @@ mod tests {
         assert_eq!(out.uri().query(), Some("token=abc"));
     }
 
-    #[test]
-    fn the_affinity_cookie_is_read_and_ignored_when_absent() {
-        let with = axum::extract::Request::builder()
-            .header("cookie", "other=1; dsr-instance=notes; more=2")
+    /// A request carrying a `Referer` and the set of served instances.
+    fn request_from(referer: Option<&str>, known: &[&str]) -> axum::extract::Request {
+        let mut builder = axum::extract::Request::builder();
+        if let Some(r) = referer {
+            builder = builder.header("referer", r);
+        }
+        let mut req = builder
             .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(current_instance(&with).as_deref(), Some("notes"));
-
-        let without = axum::extract::Request::builder()
-            .header("cookie", "other=1")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(current_instance(&without), None);
-
-        let none = axum::extract::Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(current_instance(&none), None);
+            .expect("a test request builds");
+        req.extensions_mut().insert(KnownInstances(
+            known.iter().map(|s| (*s).to_string()).collect(),
+        ));
+        req
     }
 
     #[test]
-    fn opening_an_instance_sets_affinity_but_a_bare_path_does_not() {
-        // Setting it on every request would let a stray background call re-point
-        // the browser; only the instance's own document should do that.
-        let response = || {
-            axum::response::Response::builder()
-                .status(200)
-                .body(axum::body::Body::empty())
-                .unwrap()
-        };
+    fn the_instance_comes_from_the_referer_per_request() {
+        // The design that finally worked. A cookie cannot answer this correctly:
+        // the first attempt stored one "current instance" and the second tab
+        // overwrote it, so the first tab's requests went to the wrong harness.
+        // The browser states the origin of each request individually, so two tabs
+        // never contend.
+        let notes = request_from(Some("http://127.0.0.1:3090/i/notes/"), &["notes", "probe"]);
+        assert_eq!(current_instance(&notes).as_deref(), Some("notes"));
 
-        let marked = with_affinity_cookie(response(), "/i/notes/");
-        let cookie = marked
-            .headers()
-            .get(axum::http::header::SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert!(cookie.contains("dsr-instance=notes"), "{cookie}");
-        assert!(cookie.contains("Path=/"), "{cookie}");
+        let probe = request_from(
+            Some("http://127.0.0.1:3090/i/probe/api/x"),
+            &["notes", "probe"],
+        );
+        assert_eq!(current_instance(&probe).as_deref(), Some("probe"));
+    }
 
-        let untouched = with_affinity_cookie(response(), "/api/settings/describe");
-        assert!(untouched
-            .headers()
-            .get(axum::http::header::SET_COOKIE)
-            .is_none());
+    #[test]
+    fn a_request_with_no_referer_routes_nowhere() {
+        // A client that sends no Referer gets no guess. Serving an arbitrary
+        // instance would be worse than declining.
+        assert_eq!(current_instance(&request_from(None, &["notes"])), None);
+        assert_eq!(
+            current_instance(&request_from(Some("http://127.0.0.1:3090/"), &["notes"])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_instance_in_the_referer_routes_nowhere() {
+        // A page for an instance the gateway no longer serves must not be
+        // forwarded to a prefix no route matches.
+        assert_eq!(
+            current_instance(&request_from(
+                Some("http://127.0.0.1:3090/i/gone/"),
+                &["notes"]
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn a_relative_referer_is_accepted() {
+        // Browsers normally send an absolute Referer, but the parsing must not
+        // depend on the scheme being present.
+        let req = request_from(Some("/i/notes/"), &["notes"]);
+        assert_eq!(current_instance(&req).as_deref(), Some("notes"));
     }
 
     #[test]

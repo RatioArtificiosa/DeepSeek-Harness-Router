@@ -154,6 +154,22 @@ enum Command {
     Open {
         /// Which instance.
         name: String,
+
+        /// Open it through the control page's origin instead of its own port.
+        ///
+        /// # When to use this
+        ///
+        /// The default opens the instance's own port, which is what you want for
+        /// real work: a separate origin per instance means a separate session per
+        /// instance, so several tabs stay signed in at once.
+        ///
+        /// This flag gives you the single-origin view instead. It is the same
+        /// address the control page links to, which is convenient for a quick
+        /// look — but the harness signs the request authority into its auth
+        /// cookie, so all instances reached this way share one session and only
+        /// the most recently opened one stays signed in.
+        #[arg(long)]
+        via_gateway: bool,
     },
 
     /// Show an instance's captured output.
@@ -407,7 +423,7 @@ async fn run(cli: Cli, style: &Style) -> Result<ExitCode, Failure> {
         Command::Start { name, open } => cmd_start(style, &name, open).await,
         Command::Stop { name, all } => cmd_stop(style, name.as_deref(), all).await,
         Command::Restart { name, open } => cmd_restart(style, &name, open).await,
-        Command::Open { name } => cmd_open(style, &name),
+        Command::Open { name, via_gateway } => cmd_open(style, &name, via_gateway),
         Command::Logs { name } => cmd_logs(style, &name).await,
         Command::Rm { name, yes } => cmd_rm(style, &name, yes).await,
         Command::Status => cmd_status(style),
@@ -1191,7 +1207,7 @@ fn cmd_status(style: &Style) -> Result<ExitCode, Failure> {
 // open / logs / rm
 // ─────────────────────────────────────────────────────────────────────────
 
-fn cmd_open(style: &Style, name: &str) -> Result<ExitCode, Failure> {
+fn cmd_open(style: &Style, name: &str, via_gateway: bool) -> Result<ExitCode, Failure> {
     let (home, registry) = load(None)?;
     let instance = registry
         .get(name)
@@ -1208,26 +1224,48 @@ fn cmd_open(style: &Style, name: &str) -> Result<ExitCode, Failure> {
     // answered with "dsh web authentication required". So the URL is read from
     // where `start` recorded it, rather than rebuilt from the port — which is
     // what produced a link that could never work.
-    // The preferred URL goes through the running gateway when there is one.
     //
-    // # Why the gateway URL wins
+    // # Why this opens the instance's own port, not the gateway
     //
-    // Both URLs work in isolation, so this is a choice, not a correction. The
-    // gateway is preferred for two reasons: it is the same origin the control
-    // page uses, so a browser ends up with one tab per instance under one
-    // authority rather than one tab per port; and it is the path that is
-    // actually exercised, so a regression in the relay shows up here instead of
-    // hiding behind the direct route that bypasses it entirely.
+    // The gateway was preferred here for a while, and it is the wrong default.
+    // The harness signs the request *authority* into its auth cookie and gives
+    // that cookie a name derived from the same authority. Through the gateway
+    // every instance shares one authority, so they share one cookie name — and
+    // logging into a second instance replaces the first one's cookie. Two tabs on
+    // two instances therefore cannot both stay signed in; the older tab starts
+    // failing with 401s that point nowhere near the cause.
     //
-    // The direct URL remains the fallback, because a gateway that is not running
-    // is the normal case for someone who only ever uses `router open`.
+    // A different port is a different origin, so each instance gets its own
+    // cookie name and its own session. Two tabs on two ports coexist, verified in
+    // a real browser. That is the property the product is for, so it wins over
+    // the convenience of a single origin for the *UI*.
+    //
+    // The gateway keeps its real job: the control page, where every instance is
+    // listed and reachable in one place, one at a time.
     let instance_dir = home.instance_dir(name);
     let url = match router_dsh::browser::read(&instance_dir) {
         Some(u) => {
-            let via_gateway = control::read_gateway_port(&home)
-                .filter(|port| probe_port(*port))
-                .and_then(|port| gateway_url(&u, name, port));
-            via_gateway.unwrap_or(u)
+            if via_gateway {
+                let direct = u;
+                let via = control::read_gateway_port(&home)
+                    .filter(|port| probe_port(*port))
+                    .and_then(|port| gateway_url(&direct, name, port));
+                match via {
+                    Some(g) => g,
+                    None => {
+                        // Asked for the gateway and it is not there. Say so
+                        // rather than silently opening something else.
+                        return Err(Failure::runtime(
+                            "no control page is running to open this through".to_string(),
+                            "Start it with `router serve`, or drop --via-gateway to open \
+                             the instance's own port."
+                                .to_string(),
+                        ));
+                    }
+                }
+            } else {
+                u
+            }
         }
         None => {
             // Something is listening but no token was recorded. Say what is
