@@ -47,13 +47,38 @@ pub enum WorkspaceMode {
 pub struct WorkspacePath {
     host_path: PathBuf,
     docker_path: String,
+    /// The physical directory this path refers to, with symlinks resolved.
+    ///
+    /// # Why this is separate from `host_path`
+    ///
+    /// `host_path` is what the user typed, canonicalised lexically — it may
+    /// contain a symlink, and it is what we should hand to the harness so the
+    /// instance works exactly as the user expects.
+    ///
+    /// Identity is a different question. Two spellings of the same directory —
+    /// a real path and a symlink to it — are the *same* directory, and the rule
+    /// that no two instances share a workspace is about the directory, not the
+    /// spelling. Comparing `host_path` missed that: a real path and a symlink to
+    /// it registered as two instances sharing one physical tree, which is the
+    /// two-agents-one-project hazard the check exists to prevent.
+    identity: PathBuf,
 }
 
 impl WorkspacePath {
-    /// The canonical absolute host path.
+    /// The canonical absolute host path, as the user spelled it.
     #[must_use]
     pub fn host(&self) -> &Path {
         &self.host_path
+    }
+
+    /// The physical directory, with symlinks resolved.
+    ///
+    /// Used for uniqueness checks. Falls back to the lexical path when the
+    /// filesystem cannot resolve it, so a check never fails open into "assume
+    /// unique" — it compares what it can see and says so.
+    #[must_use]
+    pub fn identity(&self) -> &Path {
+        &self.identity
     }
 
     /// The path as Docker should receive it: forward slashes, no trailing
@@ -304,10 +329,21 @@ pub fn validate_workspace(raw: &str, mode: WorkspaceMode) -> Result<WorkspacePat
         }
     }
 
+    // Resolve symlinks for the identity, now that the directory exists (or has
+    // just been created). `canonicalize` is the only call that answers "which
+    // physical directory is this", and it requires the path to exist — which is
+    // guaranteed by this point in both modes.
+    //
+    // A failure here is not fatal: the instance still works with the lexical
+    // path. It only means the uniqueness check is comparing spellings, which is
+    // the pre-existing behaviour and better than refusing a valid workspace.
+    let identity = std::fs::canonicalize(&absolute).unwrap_or_else(|_| absolute.clone());
+
     let docker_path = docker_form(&absolute);
     Ok(WorkspacePath {
         host_path: absolute,
         docker_path,
+        identity,
     })
 }
 
@@ -511,5 +547,58 @@ mod tests {
         let e = validate_workspace("/etc", WorkspaceMode::Existing).unwrap_err();
         assert!(e.detail.contains("/etc"));
         assert!(e.remediation().is_some());
+    }
+
+    #[test]
+    fn a_symlink_and_its_target_share_one_identity() {
+        // The bug this guards: a real path and a symlink to it registered as two
+        // instances sharing one physical directory, because the duplicate check
+        // compared spellings. Two agents editing one tree is the hazard the
+        // check exists for, so identity must be the directory, not the name.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&real, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&real, &link).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let linked = false;
+
+        if !linked {
+            // Symlinks need privilege on Windows. Skipping is honest; asserting
+            // a property the platform cannot express would not be.
+            return;
+        }
+
+        let a = validate_workspace(&real.to_string_lossy(), WorkspaceMode::Existing).unwrap();
+        let b = validate_workspace(&link.to_string_lossy(), WorkspaceMode::Existing).unwrap();
+
+        assert_ne!(
+            a.host(),
+            b.host(),
+            "the two spellings are genuinely different paths"
+        );
+        assert_eq!(
+            a.identity(),
+            b.identity(),
+            "but they are the same directory, and identity must say so"
+        );
+    }
+
+    #[test]
+    fn distinct_directories_have_distinct_identities() {
+        // The positive case: the identity fix must not collapse unrelated paths.
+        let dir = tempfile::tempdir().unwrap();
+        let one = dir.path().join("one");
+        let two = dir.path().join("two");
+        std::fs::create_dir(&one).unwrap();
+        std::fs::create_dir(&two).unwrap();
+
+        let a = validate_workspace(&one.to_string_lossy(), WorkspaceMode::Existing).unwrap();
+        let b = validate_workspace(&two.to_string_lossy(), WorkspaceMode::Existing).unwrap();
+        assert_ne!(a.identity(), b.identity());
     }
 }

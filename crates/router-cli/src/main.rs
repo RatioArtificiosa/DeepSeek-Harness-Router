@@ -560,7 +560,14 @@ async fn cmd_add(
 
         // Two instances on one directory means two agents editing one tree. The
         // harness will not stop that, so the router does.
-        if let Some((other, _)) = registry.find_by_workspace(validated.host()) {
+        // Compared by physical directory, not by spelling.
+        //
+        // `validated.host()` is what the user typed; `validated.identity()` is
+        // the directory it actually refers to. Using the spelling let a real
+        // path and a symlink to it register as two instances sharing one
+        // project, which is the hazard this check exists to prevent.
+        let identity = validated.identity();
+        if let Some((other, _)) = registry.find_by_workspace(identity) {
             return Err(Failure::usage(
                 format!(
                     "instance '{other}' already uses {}",
@@ -579,7 +586,11 @@ async fn cmd_add(
             )
         })?;
 
-        let mut instance = Instance::new(validated.host().to_path_buf(), outcome.port());
+        // The *resolved* path is stored, so the uniqueness check compares the
+        // same value it compares against on every future run. Storing the
+        // spelling would mean two entries could disagree about whether they
+        // point at the same directory, depending on which was registered first.
+        let mut instance = Instance::new(validated.identity().to_path_buf(), outcome.port());
         instance.model = model.clone();
         instance.share_credentials = share_credentials;
 
@@ -931,7 +942,7 @@ async fn cmd_restart(style: &Style, name: &str) -> Result<ExitCode, Failure> {
 // ─────────────────────────────────────────────────────────────────────────
 
 fn cmd_list(style: &Style, probe: bool) -> Result<ExitCode, Failure> {
-    let (_home, registry) = load(None)?;
+    let (home, registry) = load(None)?;
 
     // `--quiet` emits one line per instance, tab-separated, with nothing else.
     // A table is for a person reading a terminal; a script wants fields it can
@@ -958,12 +969,25 @@ fn cmd_list(style: &Style, probe: bool) -> Result<ExitCode, Failure> {
     }
 
     if registry.instances.is_empty() {
-        term::out(&style.dim("No instances yet."));
-        term::out("");
-        term::out(&format!(
-            "  Add one:  router add my-project --workspace {}",
-            style.paint(Ink::Blue, "~/projects/my-project")
-        ));
+        // "No instances yet" and "you have never run init" are different
+        // situations with different next steps, and the registry looks the same
+        // from here — a missing file loads as an empty one. Saying which it is
+        // costs one `exists` call and removes a confusing dead end.
+        if home.registry_path().exists() {
+            term::out(&style.dim("No instances yet."));
+            term::out("");
+            term::out(&format!(
+                "  Add one:  router add my-project --workspace {}",
+                style.paint(Ink::Blue, "~/projects/my-project")
+            ));
+        } else {
+            term::out(&style.warn(&format!(
+                "Not initialised: {} does not exist",
+                home.registry_path().display()
+            )));
+            term::out("");
+            term::out(&style.dim("  Create it with:  router init"));
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
