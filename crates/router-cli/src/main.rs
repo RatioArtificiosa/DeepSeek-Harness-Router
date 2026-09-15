@@ -426,7 +426,10 @@ async fn run(cli: Cli, style: &Style) -> Result<ExitCode, Failure> {
         Command::Open { name, via_gateway } => cmd_open(style, &name, via_gateway),
         Command::Logs { name } => cmd_logs(style, &name).await,
         Command::Rm { name, yes } => cmd_rm(style, &name, yes).await,
-        Command::Status => cmd_status(style),
+        Command::Status => {
+            let (home, _) = load(None)?;
+            cmd_status(style, &home)
+        }
         Command::Doctor => cmd_doctor(style).await,
         Command::Serve { port, no_open } => control::serve(style, port, no_open).await,
         Command::Home => {
@@ -1071,11 +1074,13 @@ fn cmd_list(style: &Style, probe: bool) -> Result<ExitCode, Failure> {
     // split without stripping colour and guessing at column widths.
     if style.verbosity == Verbosity::Quiet {
         for (name, instance) in &registry.instances {
+            // Three states, not two: a port held by something we did not start
+            // must not read as "up". See `serving_state`.
             let serving = if probe {
-                if probe_port(instance.port) {
-                    "up"
-                } else {
-                    "down"
+                match serving_state(&home.instance_dir(name), instance.port) {
+                    Serving::Ours => "up",
+                    Serving::Foreign => "foreign",
+                    Serving::Down => "down",
                 }
             } else {
                 "-"
@@ -1120,10 +1125,13 @@ fn cmd_list(style: &Style, probe: bool) -> Result<ExitCode, Failure> {
             // Without --probe the marker reflects registration, and the legend
             // below says so, rather than implying a liveness check happened.
             let marker = if probe {
-                if probe_port(instance.port) {
-                    style.paint(Ink::Green, style.glyphs.running)
-                } else {
-                    style.paint(Ink::Amber, style.glyphs.stopped)
+                match serving_state(&home.instance_dir(name), instance.port) {
+                    Serving::Ours => style.paint(Ink::Green, style.glyphs.running),
+                    // Amber with a distinct glyph: "answering, but not ours" is
+                    // neither the healthy case nor the stopped one, and showing it
+                    // as healthy is what hid a foreign process holding the port.
+                    Serving::Foreign => style.paint(Ink::Red, style.glyphs.stopped),
+                    Serving::Down => style.paint(Ink::Amber, style.glyphs.stopped),
                 }
             } else {
                 style.paint(Ink::Dim, style.glyphs.bullet)
@@ -1159,23 +1167,57 @@ fn cmd_list(style: &Style, probe: bool) -> Result<ExitCode, Failure> {
             "  {} registered. Add --probe to confirm each one is serving.",
             style.glyphs.bullet
         )));
+    } else {
+        // The legend exists so the two negative markers are not read as the same
+        // thing. "Stopped" is the ordinary case; "held by something else" needs
+        // the user to know that starting it will be refused on purpose.
+        let foreign: Vec<String> = registry
+            .instances
+            .iter()
+            .filter(|(name, instance)| {
+                serving_state(&home.instance_dir(name), instance.port) == Serving::Foreign
+            })
+            .map(|(name, instance)| {
+                let who = router_dsh::process::describe_listener(instance.port)
+                    .unwrap_or_else(|| "another process".to_string());
+                format!("  {name}: port {} is held by {who}", instance.port)
+            })
+            .collect();
+        if !foreign.is_empty() {
+            term::out("");
+            term::out(
+                &style.warn("  These instances are not running — something else holds their port:"),
+            );
+            for line in foreign {
+                term::out(&style.dim(&line));
+            }
+            term::out(&style.dim("  The router will not stop or adopt it."));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_status(style: &Style) -> Result<ExitCode, Failure> {
+fn cmd_status(style: &Style, home: &RouterHome) -> Result<ExitCode, Failure> {
     let (_home, registry) = load(None)?;
 
     // Count first, then print: the numbers are the answer and the prose is
     // commentary, so `--quiet` emits the numbers alone. A script that gates on
     // this command wants a value, not a sentence to parse.
+    //
+    // A port held by something the router did not start is counted as *down*, and
+    // reported separately. Counting it as up was the bug: three green rows, one
+    // of which was a harness the router never launched.
     let mut up = 0usize;
     let mut down = 0usize;
-    for instance in registry.instances.values() {
-        if probe_port(instance.port) {
-            up += 1;
-        } else {
-            down += 1;
+    let mut foreign = Vec::new();
+    for (name, instance) in &registry.instances {
+        match serving_state(&home.instance_dir(name), instance.port) {
+            Serving::Ours => up += 1,
+            Serving::Down => down += 1,
+            Serving::Foreign => {
+                down += 1;
+                foreign.push((name.clone(), instance.port));
+            }
         }
     }
 
@@ -1193,6 +1235,16 @@ fn cmd_status(style: &Style) -> Result<ExitCode, Failure> {
                 &down.to_string()
             )
         ));
+    }
+
+    // A foreign holder is worth naming: it is the one "down" state with a cause
+    // the user may not have caused and cannot guess.
+    for (name, port) in &foreign {
+        let who = router_dsh::process::describe_listener(*port)
+            .unwrap_or_else(|| "another process".to_string());
+        term::out(&style.warn(&format!(
+            "  {name} is not running; port {port} is held by {who}"
+        )));
     }
 
     // A non-zero exit when something is down, so a script can gate on it.
@@ -1823,6 +1875,48 @@ fn unknown_instance(name: &str, registry: &Registry) -> Failure {
 /// which is an interface we deliberately do not depend on. The honest position
 /// is that this reports "something is answering here", and the wording in
 /// `doctor` says so.
+/// How an instance's port looks right now.
+///
+/// # Why "is anything answering" is not enough
+///
+/// `probe_port` answers a wire question, and for a *reporting* command that is
+/// the wrong question. An instance whose port is held by some other process
+/// answers the probe perfectly — so `list --probe` and `status` counted it as
+/// healthy, while `start` would refuse to start it and nothing the router
+/// manages was running at all. The user sees three green rows and one of them is
+/// a harness the router neither started nor can stop.
+///
+/// Ownership is decidable: the PID recorded when the instance was started is
+/// checked against the process actually holding the port. That gives three states
+/// that need different words, so this returns them rather than a bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Serving {
+    /// The harness this router started is answering on the port.
+    Ours,
+    /// Something is answering, but it is not the instance we started. Usually a
+    /// harness started outside the router, or a leftover whose supervisor died.
+    Foreign,
+    /// Nothing is answering.
+    Down,
+}
+
+/// Classify an instance's port, including who holds it.
+fn serving_state(instance_dir: &std::path::Path, port: u16) -> Serving {
+    if !probe_port(port) {
+        return Serving::Down;
+    }
+
+    let ours = router_dsh::browser::read_pid(instance_dir)
+        .is_some_and(|pid| router_dsh::process::pid_or_descendant_listens_on(pid, port));
+
+    if ours {
+        Serving::Ours
+    } else {
+        Serving::Foreign
+    }
+}
+
+/// Whether anything accepts a connection on a loopback port.
 fn probe_port(port: u16) -> bool {
     use std::io::{Read as _, Write as _};
 
@@ -2173,6 +2267,72 @@ mod tests {
             e == "exe" || e == "bin"
         });
         assert!(is_native);
+    }
+
+    #[test]
+    fn a_port_nothing_listens_on_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert_eq!(serving_state(dir.path(), port), Serving::Down);
+    }
+
+    #[test]
+    fn a_port_held_by_something_we_did_not_start_is_foreign() {
+        // The regression this guards, found by auditing `router status` on a
+        // machine where a foreign harness held an instance port: the command
+        // counted it as "up" because the port answered, while `start` would
+        // refuse it and nothing the router managed was running. Three green rows,
+        // one of them a harness the router neither started nor can stop.
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming().take(4) {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+
+        // No PID recorded, so ownership cannot be proved — which must read as
+        // "not ours", never as healthy.
+        assert_eq!(serving_state(dir.path(), port), Serving::Foreign);
+        drop(server);
+    }
+
+    #[test]
+    fn a_recorded_pid_that_does_not_hold_the_port_is_foreign() {
+        // A stale or recycled PID must not be able to claim a port.
+        //
+        // Note the recorded PID deliberately is *not* this test process: the
+        // listener below is a thread inside this process, so this process really
+        // does hold the port and recording it would legitimately answer "ours".
+        // Writing a PID that cannot be the listener is the only way to test the
+        // stale case.
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // PID 1 cannot be this process, and is never the listener in a test.
+        router_dsh::browser::write_pid(dir.path(), 1).unwrap();
+
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming().take(4) {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+
+        assert_eq!(serving_state(dir.path(), port), Serving::Foreign);
+        drop(server);
     }
 
     #[test]
