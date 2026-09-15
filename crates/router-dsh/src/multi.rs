@@ -177,6 +177,20 @@ pub enum InstanceError {
         /// The missing directory.
         path: PathBuf,
     },
+    /// Something else was already answering on the instance's port.
+    ///
+    /// Its own variant because the remedy is unlike any other: the instance is
+    /// not broken and nothing is missing — a *different* process owns the port,
+    /// and the user must decide what to do about it. Folding this into
+    /// [`Self::Timeout`] would say "it did not start", which is both wrong and
+    /// unhelpful: it did not start *because something else is already there*.
+    #[error("port {port} is already in use by {detail}")]
+    PortInUse {
+        /// The port that was already answering.
+        port: u16,
+        /// Who is holding it, as far as can be determined.
+        detail: String,
+    },
 }
 
 impl InstanceError {
@@ -190,6 +204,7 @@ impl InstanceError {
             Self::Timeout(..) => "DSH_READY_TIMEOUT",
             Self::Unknown(_) => "INSTANCE_UNKNOWN",
             Self::WorkspaceMissing { .. } => "WORKSPACE_MISSING",
+            Self::PortInUse { .. } => "DSH_PORT_IN_USE",
         }
     }
 
@@ -211,6 +226,12 @@ impl InstanceError {
                  Run `router doctor` to see what is detected."
                     .to_string(),
             ),
+            Self::PortInUse { port, .. } => Some(format!(
+                "Something else is already using port {port}, so this instance was \
+                 not started. Stop it, or give this instance a different port: \
+                 `router edit <name> --port <free-port>`. The router will not stop \
+                 a process it did not start."
+            )),
             _ => None,
         }
     }
@@ -237,6 +258,10 @@ impl InstanceError {
             Self::WorkspaceMissing { path } => RuntimeFailure::new(
                 self.code(),
                 format!("the workspace {} no longer exists", path.display()),
+            ),
+            Self::PortInUse { port, detail } => RuntimeFailure::new(
+                self.code(),
+                format!("port {port} is already in use by {detail}"),
             ),
         }
     }
@@ -399,6 +424,57 @@ impl MultiSupervisor {
 
         self.set_state(name, RuntimeState::Starting).await;
 
+        // Refuse to start when something is already answering on the port.
+        //
+        // # Why this check has to come first
+        //
+        // The readiness loop below treats a port that answers as proof that
+        // *this* instance started. It is not: it is proof that *something* is
+        // there. Without this check the router adopts a process it did not
+        // start — it reports "ready", the user opens the instance, and they are
+        // talking to a harness whose sessions, workspace and state root are not
+        // the ones the router believes it manages. The router's own child then
+        // dies of `EADDRINUSE`, so the instance is simultaneously "running" and
+        // unable to start.
+        //
+        // This is reachable in ordinary use: a harness started outside the
+        // router, a leftover from a previous run whose supervisor process died,
+        // or a watchdog script that restarts its own harness on a port the
+        // router also uses. That last case is not hypothetical — it is how this
+        // was found.
+        //
+        // Checked before provisioning, because a refusal that writes nothing is
+        // far easier to reason about than one that has to unwind.
+        if probe_once(spec.port).await {
+            // A port held by the harness *this router started* is a restart, not
+            // a conflict: the user ran `router start` again after a previous
+            // session ended, and the harness it spawned is still answering.
+            // Anything else — another harness, a different program, an owner
+            // that cannot be identified — is refused.
+            //
+            // Ownership is established through the PID recorded at spawn time,
+            // not through the command line: every harness on the machine has an
+            // identical command line, because the state root travels in the
+            // environment, which is not readable from another process. See
+            // `browser::pid_path`.
+            //
+            // The two need opposite handling: our own instance may be adopted,
+            // because the sessions the user will see are the ones the router
+            // believes it manages. A foreign process must never be touched, and
+            // must certainly never be reported as this instance's readiness.
+            let owned = crate::browser::read_pid(&instance_dir_of(&spec.state_root))
+                .is_some_and(|pid| crate::process::pid_or_descendant_listens_on(pid, spec.port));
+            if !owned {
+                let detail = crate::process::describe_listener(spec.port)
+                    .unwrap_or_else(|| "a process the router did not start".to_string());
+                self.set_state(name, RuntimeState::Failed).await;
+                return Err(InstanceError::PortInUse {
+                    port: spec.port,
+                    detail,
+                });
+            }
+        }
+
         // The workspace is checked before anything is provisioned or spawned.
         //
         // Without this, a missing workspace surfaced as `DSH_NOT_INSTALLED` with
@@ -462,6 +538,20 @@ impl MultiSupervisor {
         {
             let mut guard = slot.lock().await;
             guard.status.pid = pid;
+        }
+
+        // Record the PID so a later `router start` can tell this harness apart
+        // from an unrelated process on the same port. Without it the router
+        // cannot prove ownership across process boundaries — see
+        // `browser::pid_path` for why the command line cannot substitute.
+        if let Some(pid) = pid {
+            let dir = instance_dir_of(&spec.state_root);
+            if let Err(e) = crate::browser::write_pid(&dir, pid) {
+                // Not fatal: the instance still runs. It only means a later
+                // restart will refuse to adopt it rather than adopt it wrongly,
+                // which is the safe direction to fail in.
+                tracing::debug!(error = %e, "could not record the harness pid");
+            }
         }
 
         let (line_tx, line_rx) = tokio::sync::mpsc::channel::<String>(256);
@@ -642,12 +732,18 @@ impl MultiSupervisor {
             // reports success. See `crate::process`.
             crate::process::kill_tree(child, grace).await;
         }
+        let state_root = guard.spec.state_root.clone();
         guard.child = None;
         guard.status.pid = None;
         // The token died with the process, so the URL is no longer usable.
         guard.status.auth_url = None;
         guard.status.state = RuntimeState::Stopped;
         drop(guard);
+
+        // The recorded PID describes a process that no longer exists. Left in
+        // place it would let a later restart adopt whatever process next reuses
+        // that number and binds the port.
+        crate::browser::clear_pid(&instance_dir_of(&state_root));
 
         self.publish().await;
         Ok(())
@@ -732,6 +828,18 @@ fn log_signal(line: &str) {
     }
 }
 
+/// The instance directory that owns a state root.
+///
+/// A state root is always `<instance dir>/dsh`, so the parent is the directory
+/// where the router keeps that instance's own bookkeeping. Derived rather than
+/// stored, so there is one definition of the layout and no chance of the two
+/// disagreeing.
+fn instance_dir_of(state_root: &std::path::Path) -> std::path::PathBuf {
+    state_root
+        .parent()
+        .map_or_else(|| state_root.to_path_buf(), std::path::Path::to_path_buf)
+}
+
 /// One reachability probe on loopback.
 ///
 /// Any accepted connection counts, including one the harness will later answer
@@ -780,6 +888,21 @@ mod tests {
             share_credentials: false,
             env: BTreeMap::new(),
         }
+    }
+
+    /// A port that nothing is listening on, in the test range.
+    ///
+    /// A test that spawns or starts anything must not use a fixed port: `start`
+    /// refuses a port that is already answering, and a real instance may be
+    /// sitting on any `308x` port, so a hardcoded one makes the test depend on
+    /// what the machine happens to be running. Bound and released, which is
+    /// enough for a test — the ports reserved here are the documented test range
+    /// and nothing else allocates from it.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .expect("a loopback port must be available")
     }
 
     #[tokio::test]
@@ -892,10 +1015,11 @@ mod tests {
         });
 
         let dir = tempfile::tempdir().unwrap();
-        let mut a = spec("alpha", 3081);
+        let mut a = spec("alpha", free_port());
         a.state_root = dir.path().join("alpha");
         a.workspace = dir.path().to_path_buf();
-        let mut b = spec("beta", 3082);
+        let mut b = spec("beta", free_port());
+        let beta_port = b.port;
         b.state_root = dir.path().join("beta");
         b.workspace = dir.path().to_path_buf();
         sup.register(a).await;
@@ -907,7 +1031,7 @@ mod tests {
         // Beta is untouched by alpha's failure.
         let beta = sup.status_of("beta").await.unwrap();
         assert_eq!(beta.state, RuntimeState::Absent);
-        assert_eq!(beta.port, 3082);
+        assert_eq!(beta.port, beta_port);
     }
 
     #[tokio::test]
@@ -919,7 +1043,11 @@ mod tests {
         });
 
         let dir = tempfile::tempdir().unwrap();
-        let mut s = spec("alpha", 3081);
+        // A free port, not a fixed one. `start` refuses a port that is already
+        // answering, and a real user's instance may legitimately be sitting on
+        // any 308x port — so a hardcoded one makes this test depend on what
+        // happens to be running on the machine.
+        let mut s = spec("alpha", free_port());
         s.state_root = dir.path().join("state");
         s.workspace = dir.path().to_path_buf();
         s.model = Some("deepseek-v4-pro".into());

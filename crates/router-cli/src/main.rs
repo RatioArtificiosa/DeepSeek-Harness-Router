@@ -778,20 +778,28 @@ async fn start_one(
         }
         Err(e) => {
             let failure = e.to_failure();
-            let tail = supervisor.stderr_tail(name).await;
-            let hint = if tail.is_empty() {
-                format!("Run `router doctor`, then check: router logs {name}")
+            // A case with its own remedy gets that remedy, not the generic
+            // harness advice. Telling someone whose port is held by another
+            // process to run `router doctor` sends them to inspect an
+            // installation that is working perfectly.
+            let hint = if let Some(remedy) = e.remediation() {
+                remedy
             } else {
-                format!(
-                    "Last output:\n{}",
-                    tail.iter()
-                        .rev()
-                        .take(6)
-                        .rev()
-                        .map(|l| format!("    {l}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
+                let tail = supervisor.stderr_tail(name).await;
+                if tail.is_empty() {
+                    format!("Run `router doctor`, then check: router logs {name}")
+                } else {
+                    format!(
+                        "Last output:\n{}",
+                        tail.iter()
+                            .rev()
+                            .take(6)
+                            .rev()
+                            .map(|l| format!("    {l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                }
             };
             Err(Failure::runtime(
                 format!("{name} failed to start: {}", failure.code),

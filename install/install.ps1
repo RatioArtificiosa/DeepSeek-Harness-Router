@@ -307,8 +307,36 @@ function Invoke-Uninstall {
     }
 
     # The binary.
+    #
+    # A running gateway or instance holds this file open, and Windows refuses to
+    # delete a file that is in use. That is the normal case, not an exotic one:
+    # the control page is exactly the window a user would have open while
+    # deciding to uninstall. Reporting it as a crash would leave the job
+    # half-done — the PATH and the instance list still in place — so the failure
+    # is caught and explained instead, and the remaining steps are skipped
+    # rather than run against a half-removed install.
     $exe = Join-Path $script:BinDir "router.exe"
-    if (Test-Path $exe) { Remove-Item $exe -Force; Write-Ok "Removed router.exe" }
+    if (Test-Path $exe) {
+        try {
+            Remove-Item $exe -Force -ErrorAction Stop
+            Write-Ok "Removed router.exe"
+        }
+        catch {
+            Write-Host ""
+            Write-Host "      Could not remove router.exe." -ForegroundColor Yellow
+            Write-Host "      It is being held open by something that is still running" -ForegroundColor Gray
+            Write-Host "      — most likely the control page or an instance." -ForegroundColor Gray
+            Write-Host ""
+            Write-Host "      Stop them, then run this again:" -ForegroundColor White
+            Write-Host "        router list --probe        (see what is running)" -ForegroundColor DarkGray
+            Write-Host "        router stop <name>         (stop one instance)" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "      Nothing else was changed. Your instance list and PATH are" -ForegroundColor Gray
+            Write-Host "      exactly as they were." -ForegroundColor Gray
+            Write-Host ""
+            return
+        }
+    }
 
     # Remove our bin folder from PATH, but only that folder — never the rest of
     # the user's PATH, which is full of things other programs need.
@@ -322,6 +350,17 @@ function Invoke-Uninstall {
     # The registry only. The instance folders beneath it are left alone.
     $registry = Join-Path $script:RouterHome "router.yaml"
     if (Test-Path $registry) { Remove-Item $registry -Force; Write-Ok "Removed the instance list" }
+
+    # Runtime bookkeeping that describes a program which is no longer installed.
+    # Left behind, it is litter at best; at worst the recorded gateway port is
+    # read by a future install and makes `router open` offer a gateway URL that
+    # nothing answers. Deliberately not a wildcard: only files this installer
+    # knows it created are removed, so anything unexpected under the router home
+    # survives for the user to look at.
+    foreach ($stale in @("gateway-port")) {
+        $path = Join-Path $script:RouterHome $stale
+        if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
+    }
 
     Write-Host ""
     Write-Host "      Your harness, your harness data and your projects are exactly as they were." -ForegroundColor Green

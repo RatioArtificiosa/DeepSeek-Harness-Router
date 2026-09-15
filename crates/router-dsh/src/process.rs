@@ -274,6 +274,143 @@ pub fn is_listening(port: u16) -> bool {
     .is_ok()
 }
 
+/// Describe what is listening on a port, for a message a person can act on.
+///
+/// Returns `None` when nothing is listening. When something is, the description
+/// names the process and says whether it looks like a harness — because the two
+/// cases need different advice, and "port in use" alone tells a user neither
+/// what to stop nor whether stopping it is even the right move.
+///
+/// This exists so a refusal can explain itself. A bare "port 3082 is in use"
+/// sends the reader to `netstat`; naming the process lets them decide.
+#[must_use]
+pub fn describe_listener(port: u16) -> Option<String> {
+    let pids = listeners_on(port)?;
+    if pids.is_empty() {
+        return None;
+    }
+
+    let mut described = Vec::new();
+    for pid in pids {
+        match process_command_line(pid) {
+            Some(cmd) if looks_like_our_harness(&cmd) => {
+                described.push(format!("pid {pid} (another DeepSeek Harness)"));
+            }
+            Some(cmd) => {
+                // Only the program name is shown, and only the first path
+                // segment of it. The full command line can contain a workspace
+                // path or a token, and a diagnostic is not a reason to print
+                // either.
+                let program = cmd.split_whitespace().next().unwrap_or("a process");
+                let name = Path::new(program)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(program);
+                described.push(format!("pid {pid} ({name})"));
+            }
+            None => described.push(format!("pid {pid}")),
+        }
+    }
+
+    Some(described.join(", "))
+}
+
+/// Whether `pid` holds `port`, directly or through a descendant.
+///
+/// # Why descendants count
+///
+/// On Windows the router spawns the `dsh.cmd` shim, so the PID it records at
+/// spawn time belongs to `cmd.exe` — while the process that actually binds the
+/// port is a `node` grandchild. Checking only the recorded PID would therefore
+/// never recognise the router's own harness, and every restart would be refused
+/// as a foreign conflict. This is the same shim-versus-harness gap that
+/// [`kill_tree`] exists to solve, met from the other direction.
+///
+/// The walk is bounded: it stops at a fixed depth and only ever follows children
+/// of the recorded process, so it cannot wander into unrelated parts of the
+/// process tree.
+#[must_use]
+pub fn pid_or_descendant_listens_on(pid: u32, port: u16) -> bool {
+    let Some(listeners) = listeners_on(port) else {
+        return false;
+    };
+    if listeners.is_empty() {
+        return false;
+    }
+
+    let family = descendants_of(pid, MAX_DESCENDANT_DEPTH);
+    listeners.iter().any(|listener| family.contains(listener))
+}
+
+/// How deep the shim-to-harness walk may go.
+///
+/// A `.cmd` shim adds one `cmd.exe`, which adds one `node`; a launcher script
+/// could add a third. Four is generous for a known chain while still bounding
+/// the walk on a machine running unrelated processes.
+const MAX_DESCENDANT_DEPTH: u32 = 4;
+
+/// `pid` and every descendant of it, up to `depth` levels.
+///
+/// Returns an empty list when the process is gone, which callers read as "not
+/// ours" — the safe direction.
+#[cfg(windows)]
+fn descendants_of(pid: u32, depth: u32) -> Vec<u32> {
+    let mut found = vec![pid];
+    let mut frontier = vec![pid];
+
+    for _ in 0..depth {
+        if frontier.is_empty() {
+            break;
+        }
+        // One query per level rather than per process: `Get-CimInstance` is a
+        // PowerShell startup, and doing it once per node would dominate the cost
+        // of the check.
+        let filter = frontier
+            .iter()
+            .map(|p| format!("ParentProcessId={p}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let Some(output) = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "Get-CimInstance Win32_Process -Filter \"{filter}\" \
+                     -ErrorAction SilentlyContinue | \
+                     Select-Object -ExpandProperty ProcessId"
+                ),
+            ])
+            .output()
+            .ok()
+        else {
+            break;
+        };
+
+        let mut next = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(child) = line.trim().parse::<u32>() {
+                if !found.contains(&child) {
+                    found.push(child);
+                    next.push(child);
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    found
+}
+
+/// `pid` and every descendant of it, up to `depth` levels.
+///
+/// Unix has no equivalent ambiguity: the spawned child *is* the process, so the
+/// recorded PID is the listener and there is nothing to walk.
+#[cfg(not(windows))]
+fn descendants_of(pid: u32, _depth: u32) -> Vec<u32> {
+    vec![pid]
+}
+
 /// PIDs listening on a port, or `None` if the query itself failed.
 ///
 /// `None` and an empty list mean different things: "I could not find out" versus

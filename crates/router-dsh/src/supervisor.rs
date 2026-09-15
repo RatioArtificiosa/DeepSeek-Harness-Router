@@ -112,6 +112,17 @@ pub enum StartError {
     /// The harness announced readiness but the socket did not answer.
     #[error("the harness announced readiness but {0} did not respond")]
     Unreachable(String),
+    /// Something else was already answering on the instance's port.
+    ///
+    /// Distinct from [`Self::Timeout`]: the port is not silent, it is occupied
+    /// by a process this supervisor did not start and cannot vouch for.
+    #[error("{detail}")]
+    PortInUse {
+        /// The port that was already answering.
+        port: u16,
+        /// A human-readable description, including the owner when it is known.
+        detail: String,
+    },
 }
 
 impl StartError {
@@ -123,6 +134,7 @@ impl StartError {
             Self::ExitedEarly { .. } => "DSH_EXITED",
             Self::Timeout(..) => "DSH_READY_TIMEOUT",
             Self::Unreachable(_) => "RELAY_UPSTREAM_UNREACHABLE",
+            Self::PortInUse { .. } => "DSH_PORT_IN_USE",
         }
     }
 
@@ -145,6 +157,7 @@ impl StartError {
             Self::Unreachable(u) => {
                 RuntimeFailure::new(self.code(), format!("{u} did not respond"))
             }
+            Self::PortInUse { detail, .. } => RuntimeFailure::new(self.code(), detail.clone()),
         }
     }
 }
@@ -236,6 +249,41 @@ impl Supervisor {
             inner.stderr_tail.clear();
             inner.started_at = Some(Instant::now());
         }
+
+        // Refuse to start when something is already answering on the port.
+        //
+        // # Why this check has to come first
+        //
+        // Without it, the readiness loop below sees a port that answers, calls
+        // it ready, and reports success — attributing the *other* process's
+        // liveness to this instance. The router then believes it is running an
+        // instance it never started, while its own child boots into
+        // `EADDRINUSE` and dies. The user is told "ready" about a harness the
+        // router does not own, cannot stop, and whose sessions are not the ones
+        // they think they are talking to.
+        //
+        // This is reachable in normal use: a harness started outside the router
+        // on an instance port, a leftover from a previous run, or — the case
+        // that exposed it — a supervisor script restarting a harness on a port
+        // the router also uses.
+        //
+        // Checked before spawning, because a refusal that leaves no process
+        // behind is far easier to reason about than one that has to clean up.
+        if probe_once(&format!("http://127.0.0.1:{}", self.config.internal_port)).await {
+            let port = self.config.internal_port;
+            let detail = crate::process::describe_listener(port).unwrap_or_default();
+            let message = if detail.is_empty() {
+                format!("port {port} is already answering, so this instance was not started")
+            } else {
+                format!("port {port} is already in use by {detail}")
+            };
+            self.set_state(RuntimeState::Failed).await;
+            return Err(StartError::PortInUse {
+                port,
+                detail: message,
+            });
+        }
+
         self.set_state(RuntimeState::Starting).await;
 
         let argv = self.config.command_argv();
@@ -584,6 +632,23 @@ mod tests {
         }
     }
 
+    /// A config whose port nothing is listening on.
+    ///
+    /// `start` refuses a port that already answers, so a test that calls it must
+    /// not use a fixed one: a real instance may be sitting on any `308x` port,
+    /// and the test would then fail for a reason that has nothing to do with what
+    /// it is checking.
+    fn cfg_on_a_free_port() -> SupervisorConfig {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .expect("a loopback port must be available");
+        SupervisorConfig {
+            internal_port: port,
+            ..cfg()
+        }
+    }
+
     #[test]
     fn argv_binds_loopback_and_never_opens_a_browser() {
         let argv = cfg().command_argv();
@@ -656,7 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_fails_with_a_named_code() {
-        let mut c = cfg();
+        let mut c = cfg_on_a_free_port();
         c.binary = "/definitely/not/a/real/binary".into();
         let sup = Supervisor::new(c);
         let err = sup.start().await.unwrap_err();
@@ -665,6 +730,45 @@ mod tests {
             sup.status().await.state,
             RuntimeState::Starting,
             "a spawn failure happens before the state can advance to Failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_port_already_answering_is_refused_not_adopted() {
+        // The regression this guards: a listener the router did not start was
+        // reported as this instance's readiness. The router then claimed an
+        // instance it had never launched — one it could not stop, whose sessions
+        // were not the ones the user believed they were talking to.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Held open for the duration, so the port genuinely answers.
+        let _held = listener;
+
+        let sup = Supervisor::new(SupervisorConfig {
+            internal_port: port,
+            ..cfg()
+        });
+        let err = sup.start().await.unwrap_err();
+        assert_eq!(err.code(), "DSH_PORT_IN_USE");
+        assert_eq!(sup.status().await.state, RuntimeState::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_refused_port_names_the_port_in_its_message() {
+        // The message is the whole point of the failure: "it did not start" is
+        // useless without saying what is in the way.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _held = listener;
+
+        let sup = Supervisor::new(SupervisorConfig {
+            internal_port: port,
+            ..cfg()
+        });
+        let err = sup.start().await.unwrap_err();
+        assert!(
+            err.to_string().contains(&port.to_string()),
+            "the refusal must name the port, got: {err}"
         );
     }
 

@@ -99,6 +99,61 @@ pub fn has_token(url: &str) -> bool {
         && !url.ends_with("token=")
 }
 
+/// Where the PID of the harness this instance started is recorded.
+///
+/// # Why a PID file, and not a command-line check
+///
+/// To adopt a listener on a restart, the router must prove the process is the one
+/// *it* started. The obvious test — does the command line mention this instance's
+/// state root? — does not work: the harness receives its state root through the
+/// `DSH_HOME` environment variable, and one process's environment is not readable
+/// from another on Windows at all. The command line is therefore identical for
+/// every harness on the machine, and cannot distinguish them.
+///
+/// What the router *can* do is remember. It spawns the child, so it knows the PID
+/// at the moment of creation, and a file carries that across process boundaries
+/// for the same reason [`url_path`] does.
+///
+/// A recorded PID is only trusted after being checked for liveness *and* for
+/// looking like a harness, so a recycled PID cannot make the router adopt an
+/// unrelated process. This is a safety check, not authentication: it prevents an
+/// accident, which is the realistic risk.
+#[must_use]
+pub fn pid_path(instance_dir: &Path) -> PathBuf {
+    instance_dir.join("harness-pid")
+}
+
+/// Record the PID of the harness this instance started.
+///
+/// # Errors
+///
+/// Returns the operating system error when the file cannot be written. A caller
+/// may ignore this without harm: the instance still runs, and the only
+/// consequence is that a later restart refuses to adopt it rather than adopting
+/// it wrongly — which is the safe direction to fail in.
+pub fn write_pid(instance_dir: &Path, pid: u32) -> std::io::Result<()> {
+    std::fs::create_dir_all(instance_dir)?;
+    std::fs::write(pid_path(instance_dir), pid.to_string())
+}
+
+/// Read a previously recorded PID, if one is present and parses.
+#[must_use]
+pub fn read_pid(instance_dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(pid_path(instance_dir))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Remove a recorded PID.
+///
+/// A missing file is success, for the same reason as [`clear`]: the goal is that
+/// no usable claim remains.
+pub fn clear_pid(instance_dir: &Path) {
+    let _ = std::fs::remove_file(pid_path(instance_dir));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
