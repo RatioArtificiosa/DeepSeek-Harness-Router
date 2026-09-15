@@ -676,7 +676,27 @@ async fn start_one(
 
     match supervisor.start(name).await {
         Ok(report) => {
-            let url = format!("http://127.0.0.1:{}", instance.port);
+            // Record the authenticated URL where another process can find it.
+            //
+            // The token is per-process and in-memory, so `router open` — which
+            // runs in its own process — cannot see it any other way. Falling
+            // back to a port-only URL when nothing was announced would produce
+            // a link the harness refuses, so the absence is reported instead.
+            let url = match supervisor.status_of(name).await.and_then(|s| s.auth_url) {
+                Some(u) => {
+                    if let Err(e) = router_dsh::browser::write(&home.instance_dir(name), &u) {
+                        term::err(&style.warn(&format!("  could not record the browser URL: {e}")));
+                    }
+                    u
+                }
+                None => {
+                    term::err(&style.warn(
+                        "  the harness did not announce a browser URL, so \
+                         `router open` will not work for this instance",
+                    ));
+                    format!("http://127.0.0.1:{}", instance.port)
+                }
+            };
             if style.verbosity == Verbosity::Quiet {
                 term::out(&url);
             } else {
@@ -722,10 +742,11 @@ async fn start_one(
 }
 
 async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCode, Failure> {
-    // Only the registry is needed: stopping works from the port, so nothing here
-    // depends on the router home or on a supervisor that this process does not
-    // own.
-    let (_, registry) = load(None)?;
+    // The registry supplies the ports to stop; stopping itself works from the
+    // port, so no supervisor is needed — this process did not start the
+    // harness. The home is needed to find each instance directory, where the
+    // now-dead browser URL is recorded.
+    let (home, registry) = load(None)?;
 
     // A name together with `--all` is contradictory. Previously the name was
     // required and then silently ignored, so `stop alpha --all` stopped
@@ -746,7 +767,13 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
             // By port, not by child handle: this process did not start the
             // harness. See `stop_instance`.
             match stop_instance(instance.port).await {
-                Ok(()) => stopped += 1,
+                Ok(()) => {
+                    // The token died with the process, so the recorded URL is
+                    // no longer usable. Leaving it would let `open` offer a
+                    // link that cannot work.
+                    router_dsh::browser::clear(&home.instance_dir(n));
+                    stopped += 1;
+                }
                 Err(reason) => failures.push((n.to_string(), reason, instance.port)),
             }
         }
@@ -791,6 +818,9 @@ async fn cmd_stop(style: &Style, name: Option<&str>, all: bool) -> Result<ExitCo
         // for a reason nothing on screen explains.
         return Err(stop_failure(name, &reason, instance.port));
     }
+
+    // The token died with the process.
+    router_dsh::browser::clear(&home.instance_dir(name));
 
     if style.verbosity != Verbosity::Quiet {
         term::out(&style.ok(&format!("Stopped {}", style.strong(name))));
@@ -1086,12 +1116,10 @@ fn cmd_status(style: &Style) -> Result<ExitCode, Failure> {
 // ─────────────────────────────────────────────────────────────────────────
 
 fn cmd_open(style: &Style, name: &str) -> Result<ExitCode, Failure> {
-    let (_home, registry) = load(None)?;
+    let (home, registry) = load(None)?;
     let instance = registry
         .get(name)
         .ok_or_else(|| unknown_instance(name, &registry))?;
-
-    let url = format!("http://127.0.0.1:{}", instance.port);
 
     if !probe_port(instance.port) {
         return Err(Failure::runtime(
@@ -1099,6 +1127,26 @@ fn cmd_open(style: &Style, name: &str) -> Result<ExitCode, Failure> {
             format!("Start it first: router start {name}"),
         ));
     }
+
+    // The harness requires a per-process token, and a URL without it is
+    // answered with "dsh web authentication required". So the URL is read from
+    // where `start` recorded it, rather than rebuilt from the port — which is
+    // what produced a link that could never work.
+    let instance_dir = home.instance_dir(name);
+    let url = match router_dsh::browser::read(&instance_dir) {
+        Some(u) => u,
+        None => {
+            // Something is listening but no token was recorded. Say what is
+            // actually true instead of opening a page that will be refused.
+            return Err(Failure::runtime(
+                format!("no browser URL is recorded for {name}"),
+                format!(
+                    "The token is issued when the instance starts, so it must be \
+                     started by the router: router restart {name}"
+                ),
+            ));
+        }
+    };
 
     match open_browser(&url) {
         Ok(()) => {

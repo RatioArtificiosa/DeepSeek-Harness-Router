@@ -9,16 +9,24 @@
 PROPOSAL.md
 CHECKLIST.md
 
-# ── PRIVATE INSTALLER ────────────────────────────────────────────────
-# The owner's personal installation tooling is deliberately absent
-# from this repository.
-installer/
+# ── PRIVATE AUTHORING TOOLING ────────────────────────────────────────
+# The installer itself now ships (see `install/`). What stays private is
+# the owner's own machine-specific configuration and any file that would
+# carry absolute paths, hostnames, or personal identifiers into public
+# history.
 *.local.md
 *.local.ps1
 *.local.sh
+*.local.json
+*.local.yaml
 router-image.tar
 router-image.tar.gz
 checksums.local.txt
+
+# A user's own answers to the installer's questions, and any state the
+# installer keeps about this machine.
+install-state.json
+installer-answers.*
 
 # ── LOCAL ENVIRONMENT ────────────────────────────────────────────────
 # Contains absolute paths from this machine. Never commit.

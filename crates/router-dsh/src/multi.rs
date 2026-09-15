@@ -128,6 +128,20 @@ impl Default for MultiConfig {
     }
 }
 
+/// How long to keep listening for the announced browser URL after the port
+/// answers.
+///
+/// The harness binds its socket slightly before it prints the line carrying the
+/// authentication token — measured at roughly 0.7s apart on a real harness. A
+/// supervisor that stops reading the moment the port answers will therefore
+/// discard the token about half the time, producing an instance that works but
+/// cannot be opened in a browser.
+///
+/// Generous relative to the measured gap, because the cost of waiting is a
+/// fraction of a second on a path that already took seconds, while the cost of
+/// not waiting is an unusable link.
+const URL_GRACE_MS: u64 = 3000;
+
 /// Why starting one instance failed.
 #[derive(Debug, thiserror::Error)]
 pub enum InstanceError {
@@ -339,6 +353,21 @@ impl MultiSupervisor {
         self.publish().await;
     }
 
+    /// Record the authenticated URL an instance announced, or clear it.
+    ///
+    /// The token belongs to one process, so this is set when that process is
+    /// confirmed reachable and cleared when it stops — see
+    /// [`RuntimeStatus::auth_url`](crate::state::RuntimeStatus::auth_url).
+    async fn set_auth_url(&self, name: &str, url: Option<String>) {
+        {
+            let slots = self.slots.read().await;
+            let Some(slot) = slots.get(name) else { return };
+            let mut guard = slot.lock().await;
+            guard.status.auth_url = url;
+        }
+        self.publish().await;
+    }
+
     /// Start one instance.
     ///
     /// # Errors
@@ -478,6 +507,9 @@ impl MultiSupervisor {
         let port = { slot.lock().await.spec.port };
         let deadline = Instant::now() + self.config.ready_timeout;
         let mut announced = false;
+        // Captured, not discarded — the harness publishes its per-process
+        // authentication token exactly once, on this line, and nowhere else.
+        let mut captured_url: Option<String> = None;
 
         loop {
             if deadline.saturating_duration_since(Instant::now()).is_zero() {
@@ -507,7 +539,11 @@ impl MultiSupervisor {
 
                 line = line_rx.recv() => {
                     if let Some(l) = line {
-                        if matches!(classify_line(&l), OutputSignal::Ready { .. }) {
+                        // Keep the URL. A URL built from the port alone is
+                        // rejected by the harness with "authentication
+                        // required"; the token lives only in this line.
+                        if let OutputSignal::Ready { url } = classify_line(&l) {
+                            captured_url = Some(url);
                             announced = true;
                         }
                         log_signal(&l);
@@ -516,6 +552,7 @@ impl MultiSupervisor {
 
                 () = tokio::time::sleep(Duration::from_millis(250)), if announced => {
                     if self.confirm_ready(slot, port).await {
+                        self.set_auth_url(name, captured_url.take()).await;
                         return Ok(());
                     }
                 }
@@ -525,6 +562,31 @@ impl MultiSupervisor {
                 // The line remains the fast path.
                 () = tokio::time::sleep(Duration::from_millis(500)) => {
                     if self.confirm_ready(slot, port).await {
+                        // The port answers slightly *before* the URL line is
+                        // printed — measured at about 0.7s on a real harness —
+                        // so returning immediately here would discard the token.
+                        //
+                        // The window is bounded and short. Waiting a moment for
+                        // a line already on its way costs nothing when it
+                        // arrives, and one short delay when a harness genuinely
+                        // prints none. Giving up instantly would leave an
+                        // instance that works but can never be opened in a
+                        // browser — the bug this exists to fix.
+                        let grace = Instant::now() + Duration::from_millis(URL_GRACE_MS);
+                        while captured_url.is_none() && Instant::now() < grace {
+                            let Ok(Some(l)) =
+                                tokio::time::timeout(Duration::from_millis(100), line_rx.recv())
+                                    .await
+                            else {
+                                continue;
+                            };
+                            if let OutputSignal::Ready { url } = classify_line(&l) {
+                                captured_url = Some(url);
+                            } else {
+                                log_signal(&l);
+                            }
+                        }
+                        self.set_auth_url(name, captured_url.take()).await;
                         return Ok(());
                     }
                 }
@@ -582,6 +644,8 @@ impl MultiSupervisor {
         }
         guard.child = None;
         guard.status.pid = None;
+        // The token died with the process, so the URL is no longer usable.
+        guard.status.auth_url = None;
         guard.status.state = RuntimeState::Stopped;
         drop(guard);
 

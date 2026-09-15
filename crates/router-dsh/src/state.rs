@@ -87,6 +87,30 @@ pub struct RuntimeStatus {
     /// The last error, if the runtime failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<RuntimeFailure>,
+
+    /// The authenticated URL the harness announced when it became ready.
+    ///
+    /// # Why this must be captured, and cannot be derived
+    ///
+    /// The harness gates its browser interface behind a token that is 32 random
+    /// bytes generated **in memory, per process, at startup**. It is never
+    /// written to disk and never sent anywhere except the one line the harness
+    /// prints to its own stdout:
+    ///
+    /// ```text
+    /// dsh web: http://127.0.0.1:3082/?token=<32 random bytes>
+    /// ```
+    ///
+    /// So a URL built from the port alone — `http://127.0.0.1:3082` — is always
+    /// rejected with `dsh web authentication required`. That is not a broken
+    /// instance; it is a URL missing its only credential. And because the token
+    /// is per-process, a stored URL is valid exactly as long as that process
+    /// lives: restart the instance and the token is different.
+    ///
+    /// Cleared on stop, because a URL for a process that no longer exists
+    /// invites the user to open a page that cannot work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
 }
 
 impl Default for RuntimeStatus {
@@ -99,6 +123,7 @@ impl Default for RuntimeStatus {
             restarts: 0,
             ready_in_ms: None,
             last_error: None,
+            auth_url: None,
         }
     }
 }

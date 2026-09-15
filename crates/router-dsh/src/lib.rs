@@ -25,6 +25,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod browser;
 pub mod multi;
 pub mod process;
 pub mod provisioning;

@@ -83,6 +83,15 @@ impl SupervisorConfig {
     }
 }
 
+/// How long to keep listening for the announced browser URL after the port
+/// answers.
+///
+/// The harness binds its socket slightly before printing the line that carries
+/// the authentication token — measured at roughly 0.7s apart. Returning the
+/// moment the port answers discards the token, producing an instance that runs
+/// but cannot be opened in a browser.
+const URL_GRACE_MS: u64 = 3000;
+
 /// Why a start attempt failed.
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
@@ -197,6 +206,20 @@ impl Supervisor {
         let _ = self.status_tx.send(snapshot);
     }
 
+    /// Record the authenticated URL the harness announced.
+    ///
+    /// `None` clears it, which is what stopping must do: the token belongs to a
+    /// process, and offering a URL for a process that has exited invites the
+    /// user to open a page that cannot work — a failure that would look like a
+    /// bug in the router rather than what it is, a stale link.
+    async fn set_auth_url(&self, url: Option<String>) {
+        let mut inner = self.inner.lock().await;
+        inner.status.auth_url = url;
+        let snapshot = inner.status.clone();
+        drop(inner);
+        let _ = self.status_tx.send(snapshot);
+    }
+
     /// Spawn the harness and wait until it is genuinely reachable.
     ///
     /// # Errors
@@ -274,6 +297,10 @@ impl Supervisor {
     ) -> Result<(), StartError> {
         let deadline = Instant::now() + self.config.ready_timeout;
         let mut announced_ready = false;
+        // The authenticated URL the harness announced, captured rather than
+        // discarded. See the assignment below for why this is the only way to
+        // obtain it.
+        let mut captured_url: Option<String> = None;
 
         loop {
             if deadline.saturating_duration_since(Instant::now()).is_zero() {
@@ -305,7 +332,16 @@ impl Supervisor {
                     // the probe rather than declaring failure, because a runtime
                     // that closed its streams may still be serving.
                     if let Some(l) = line {
-                        if matches!(classify_line(&l), OutputSignal::Ready { .. }) {
+                        // The announced URL is captured, not discarded.
+                        //
+                        // This line is the *only* place the harness publishes its
+                        // per-process authentication token: 32 random bytes
+                        // generated in memory at startup and never written to
+                        // disk. A URL built from the port alone gets
+                        // "dsh web authentication required", which reads as a
+                        // broken instance rather than a missing parameter.
+                        if let OutputSignal::Ready { url } = classify_line(&l) {
+                            captured_url = Some(url);
                             announced_ready = true;
                         }
                         log_signal(&l);
@@ -318,6 +354,11 @@ impl Supervisor {
                     if announced_ready =>
                 {
                     if self.probe_and_confirm(&child).await {
+                        // Publish the URL the moment the instance is confirmed
+                        // reachable, so `open` has something that works.
+                        if let Some(url) = captured_url.take() {
+                            self.set_auth_url(Some(url)).await;
+                        }
                         return Ok(());
                     }
                 }
@@ -328,6 +369,27 @@ impl Supervisor {
                 // The line remains the fast path.
                 () = tokio::time::sleep(Duration::from_millis(500)) => {
                     if self.probe_and_confirm(&child).await {
+                        // The port answers slightly before the URL line is
+                        // printed, so keep listening briefly rather than
+                        // returning at once — otherwise the token is discarded
+                        // and the instance can never be opened in a browser.
+                        let grace = Instant::now() + Duration::from_millis(URL_GRACE_MS);
+                        while captured_url.is_none() && Instant::now() < grace {
+                            let Ok(Some(l)) =
+                                tokio::time::timeout(Duration::from_millis(100), line_rx.recv())
+                                    .await
+                            else {
+                                continue;
+                            };
+                            if let OutputSignal::Ready { url } = classify_line(&l) {
+                                captured_url = Some(url);
+                            } else {
+                                log_signal(&l);
+                            }
+                        }
+                        if let Some(url) = captured_url.take() {
+                            self.set_auth_url(Some(url)).await;
+                        }
                         return Ok(());
                     }
                 }
@@ -391,6 +453,9 @@ impl Supervisor {
         }
         inner.child = None;
         inner.status.pid = None;
+        // The token died with the process. Clearing it here means no later
+        // command can offer a URL that no longer authenticates.
+        inner.status.auth_url = None;
         drop(inner);
 
         self.set_state(RuntimeState::Stopped).await;
